@@ -113,9 +113,7 @@ if page == "Aminoglycoside: Initial Dose":
     expected_cmax = dose / (vd * (1 - np.exp(-ke * tau)))
     expected_cmin = expected_cmax * np.exp(-ke * tau)
 
-    st.markdown(f"**IBW:** {ibw:.2f} kg
-**Dosing Weight:** {dosing_weight:.2f} kg
-**CrCl:** {crcl:.2f} mL/min")
+    st.markdown(f"**IBW:** {ibw:.2f} kg\n**Dosing Weight:** {dosing_weight:.2f} kg\n**CrCl:** {crcl:.2f} mL/min")
     st.success(f"Recommended Initial Dose: **{dose:.0f} mg**")
     st.info(f"Expected Cmax: **{expected_cmax:.2f} mg/L**, Expected Cmin: **{expected_cmin:.2f} mg/L**")
 
