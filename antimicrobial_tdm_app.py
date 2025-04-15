@@ -121,10 +121,10 @@ if page == "Aminoglycoside: Initial Dose":
     suggest_adjustment(expected_cmin, target_cmin * 0.9, target_cmin * 1.1, label="Expected Cmin")
 
     if st.button("🧠 Interpret with LLM"):
-        prompt = f"Patient: {age} y/o {gender.lower()}, {height} cm, {weight} kg, SCr: {scr} µmol/L.
+        prompt = f"""Patient: {age} y/o {gender.lower()}, {height} cm, {weight} kg, SCr: {scr} µmol/L.
 Drug: {drug}, Cmax Target: {target_cmax}, Interval: {tau} hr.
 Calculated: Weight {dosing_weight:.2f} kg, Vd {vd:.2f} L, CrCl {crcl:.2f}, Ke {ke:.3f}, t1/2 {t_half:.2f}, Dose {dose:.0f} mg.
-Cmax {expected_cmax:.2f}, Cmin {expected_cmin:.2f}."
+Cmax {expected_cmax:.2f}, Cmin {expected_cmin:.2f}."""
         interpret_with_llm(prompt)
 
 # ===== MODULE 2: Aminoglycoside Conventional Dosing (C1/C2) =====
@@ -158,20 +158,17 @@ elif page == "Aminoglycoside: Conventional Dosing (C1/C2)":
             vd = dose / (cmax * (1 - np.exp(-ke * tau)))
             new_dose = cmax * vd * (1 - np.exp(-ke * tau))
 
-            st.markdown(f"**Ke:** {ke:.3f} hr⁻¹
-**Half-life:** {t_half:.2f} hr
-**Cmax:** {cmax:.2f} mg/L, **Cmin:** {cmin:.2f} mg/L
-**Vd:** {vd:.2f} L")
+            st.markdown(f"**Ke:** {ke:.3f} hr⁻¹\n**Half-life:** {t_half:.2f} hr\n**Cmax:** {cmax:.2f} mg/L, **Cmin:** {cmin:.2f} mg/L\n**Vd:** {vd:.2f} L")
             st.success(f"Recommended New Dose: **{new_dose:.0f} mg**")
 
             suggest_adjustment(cmax, *target_peak, label="Cmax")
             suggest_adjustment(cmin, *target_trough, label="Cmin")
 
             if st.button("🧠 Interpret with LLM"):
-                prompt = f"Aminoglycoside TDM result:
+                prompt = f"""Aminoglycoside TDM result:
 Dose: {dose} mg, C1: {c1} mg/L, C2: {c2} mg/L, Interval: {tau} hr.
 Ke: {ke:.3f}, t1/2: {t_half:.2f}, Vd: {vd:.2f}, Cmax: {cmax:.2f}, Cmin: {cmin:.2f}
-Suggested new dose: {new_dose:.0f} mg."
+Suggested new dose: {new_dose:.0f} mg."""
                 interpret_with_llm(prompt)
         else:
             st.error("❌ C1 and C2 must be greater than 0 to perform calculations.")
