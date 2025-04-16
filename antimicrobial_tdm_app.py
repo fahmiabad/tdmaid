@@ -873,7 +873,7 @@ def aminoglycoside_conventional_dosing(patient_data):
             st.error("❌ C1 and C2 must be greater than 0 to perform calculations.")
     except Exception as e:
         st.error(f"Calculation error: {e}")
-        # ===== MODULE 3: Vancomycin AUC-based Dosing =====
+      # ===== MODULE 3: Vancomycin AUC-based Dosing =====
 def vancomycin_auc_dosing(patient_data):
     st.title("🧪 Vancomycin AUC-Based Dosing")
     
@@ -967,10 +967,6 @@ def vancomycin_auc_dosing(patient_data):
         st.info(f"AUC24: {auc24:.1f} mg·hr/L")
         
         if has_measured_trough:
-            st.markdown(f"Measured Trough: **{measured_trough:.1f} mg/L**")
-        else:
-            st.markdown(f"Estimate
-            if has_measured_trough:
             st.markdown(f"Measured Trough: **{measured_trough:.1f} mg/L**")
         else:
             st.markdown(f"Estimated Trough: **{estimated_trough:.1f} mg/L**")
