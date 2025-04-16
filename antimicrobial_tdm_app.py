@@ -2,34 +2,63 @@ import streamlit as st
 import numpy as np
 import math
 import openai
-import faiss
-import pickle
-import os
 import pandas as pd
 import altair as alt
-import scipy.optimize as optimize
-from scipy.stats import norm
+
+# Optional imports - Bayesian functionality
+try:
+    import scipy.optimize as optimize
+    from scipy.stats import norm
+    BAYESIAN_AVAILABLE = True
+except ImportError:
+    BAYESIAN_AVAILABLE = False
+    print("Warning: scipy not installed. Bayesian estimation will not be available.")
+
+# Optional imports - FAISS for guideline embedding (if needed)
+try:
+    import faiss
+    import pickle
+    FAISS_AVAILABLE = True
+except ImportError:
+    FAISS_AVAILABLE = False
+    print("Warning: faiss not installed. Guideline embeddings will not be available.")
 
 st.set_page_config(page_title="Antimicrobial TDM App", layout="wide")
 
 # ===== API CONFIGURATION =====
-# Use your actual API key or st.secrets
-openai.api_key = "YOUR_OPENAI_API_KEY"
-client = openai
+# Securely access the API key from streamlit secrets
+try:
+    openai.api_key = st.secrets["openai"]["api_key"]
+    OPENAI_AVAILABLE = True
+except (KeyError, AttributeError):
+    OPENAI_AVAILABLE = False
+    st.warning("""
+    OpenAI API key not found in Streamlit secrets. LLM interpretation will not be available.
+    
+    To enable this feature:
+    1. Create a file named '.streamlit/secrets.toml' with:
+       [openai]
+       api_key = "your-api-key"
+    2. Or in Streamlit Cloud, add the secret in the dashboard
+    """)
 
 # ===== LOAD EMBEDDED GUIDELINE =====
 @st.cache_resource
 def load_guideline_embeddings():
+    if not FAISS_AVAILABLE:
+        return None, ["FAISS not installed. Guideline embeddings not available."]
+    
     # Replace this with your actual FAISS index and guideline chunks
     index = faiss.IndexFlatL2(768)  # Dummy placeholder index
     chunks = ["Guideline excerpt 1", "Guideline excerpt 2", "Guideline excerpt 3"]
     return index, chunks
 
-guideline_index, guideline_chunks = load_guideline_embeddings()
+guideline_index, guideline_chunks = None, []
+if FAISS_AVAILABLE:
+    guideline_index, guideline_chunks = load_guideline_embeddings()
 
 # ===== Global Practical Dosing Regimens =====
 practical_intervals = "6hr, 8hr, 12hr, 24hr, every other day"
-
 # ===== HELPER FUNCTION: Updated Practical Dose Adjustment =====
 def suggest_adjustment(parameter, target_min, target_max, label="Parameter", intervals=practical_intervals):
     if parameter < target_min:
@@ -144,8 +173,7 @@ def plot_concentration_time_curve(peak, trough, ke, tau, t_peak=1.0, infusion_ti
     )
     
     return chart
-
-# ===== BAYESIAN PARAMETER ESTIMATION =====
+    # ===== BAYESIAN PARAMETER ESTIMATION =====
 def bayesian_parameter_estimation(measured_levels, sample_times, dose, tau, weight, age, crcl, gender):
     """
     Bayesian estimation of PK parameters based on measured levels
@@ -163,6 +191,10 @@ def bayesian_parameter_estimation(measured_levels, sample_times, dose, tau, weig
     Returns:
     - Dictionary with estimated PK parameters
     """
+    if not BAYESIAN_AVAILABLE:
+        st.error("Bayesian estimation requires scipy. Please install it with 'pip install scipy'")
+        return None
+        
     # Prior population parameters for vancomycin
     # Mean values
     vd_pop_mean = 0.7  # L/kg
@@ -244,15 +276,38 @@ def bayesian_parameter_estimation(measured_levels, sample_times, dose, tau, weig
         't_half': t_half_opt,
         'optimization_success': result.success
     }
-
-# ===== INTERPRETATION FUNCTION =====
+    # ===== INTERPRETATION FUNCTION =====
 def interpret_with_llm(prompt):
     """
     Enhanced clinical interpretation function for antimicrobial TDM
     
-    This function would normally call the OpenAI API, but for now
-    we'll simulate the response with a more clinically relevant format.
+    This function can call the OpenAI API if configured, otherwise
+    it will provide a simulated response with clinically relevant format.
     """
+    # Check if OpenAI API is available and configured
+    if OPENAI_AVAILABLE and openai.api_key:
+        try:
+            # Call OpenAI API - uncomment and modify as needed
+            response = openai.ChatCompletion.create(
+                model="gpt-4",  # or your preferred model
+                messages=[
+                    {"role": "system", "content": "You are an expert clinical pharmacist specializing in therapeutic drug monitoring. Provide concise, evidence-based interpretations with clear recommendations."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=500
+            )
+            llm_response = response.choices[0].message.content
+            st.write("### Clinical Interpretation")
+            st.write(llm_response)
+            
+            # Add a note about source
+            st.info("Interpretation provided by OpenAI GPT-4. Always verify with clinical judgment.")
+            return
+        except Exception as e:
+            st.error(f"Error calling OpenAI API: {e}")
+            st.warning("Falling back to simulated clinical interpretation.")
+    
     # Extract the drug type from the prompt
     if "Vancomycin" in prompt:
         drug = "Vancomycin"
@@ -263,7 +318,7 @@ def interpret_with_llm(prompt):
     
     st.write("### Clinical Interpretation")
     
-    # Create a more structured, clinically relevant interpretation
+    # Simulated interpretation - create a more structured, clinically relevant format
     if drug == "Vancomycin":
         # Extract key values from the prompt
         trough_val = None
@@ -420,52 +475,92 @@ def interpret_with_llm(prompt):
     # Add the raw prompt at the bottom for debugging
     with st.expander("Raw Analysis Data", expanded=False):
         st.code(prompt)
+        
+    # Add note about simulated response
+    st.info("Simulated interpretation. For production use, configure OpenAI API in Streamlit secrets.toml")
+    # ===== SIDEBAR: NAVIGATION AND PATIENT INFO =====
+def setup_sidebar_and_navigation():
+    st.sidebar.title("📊 Navigation")
+    # Sidebar radio for selecting the module – make sure the labels exactly match with your conditions below.
+    page = st.sidebar.radio("Select Module", [
+        "Aminoglycoside: Initial Dose",
+        "Aminoglycoside: Conventional Dosing (C1/C2)",
+        "Vancomycin AUC-based Dosing"
+    ])
 
-# ===== SIDEBAR: NAVIGATION AND PATIENT INFO =====
-st.sidebar.title("📊 Navigation")
-# Sidebar radio for selecting the module – make sure the labels exactly match with your conditions below.
-page = st.sidebar.radio("Select Module", [
-    "Aminoglycoside: Initial Dose",
-    "Aminoglycoside: Conventional Dosing (C1/C2)",
-    "Vancomycin AUC-based Dosing"
-])
+    st.sidebar.title("🩺 Patient Demographics")
+    gender = st.sidebar.selectbox("Gender", ["Male", "Female"])
+    age = st.sidebar.number_input("Age (years)", min_value=0, value=65)
+    height = st.sidebar.number_input("Height (cm)", min_value=50, value=165)
+    weight = st.sidebar.number_input("Weight (kg)", min_value=1.0, value=70.0)
+    serum_cr = st.sidebar.number_input("Serum Creatinine (µmol/L)", min_value=10.0, value=90.0)
 
-st.sidebar.title("🩺 Patient Demographics")
-gender = st.sidebar.selectbox("Gender", ["Male", "Female"])
-age = st.sidebar.number_input("Age (years)", min_value=0, value=65)
-height = st.sidebar.number_input("Height (cm)", min_value=50, value=165)
-weight = st.sidebar.number_input("Weight (kg)", min_value=1.0, value=70.0)
-serum_cr = st.sidebar.number_input("Serum Creatinine (µmol/L)", min_value=10.0, value=90.0)
+    # Calculate Cockcroft-Gault Creatinine Clearance
+    with st.sidebar.expander("Creatinine Clearance (Cockcroft-Gault)", expanded=True):
+        # Calculate creatinine clearance using Cockcroft-Gault formula
+        crcl = ((140 - age) * weight * (1.23 if gender == "Male" else 1.04)) / serum_cr
+        st.success(f"CrCl: {crcl:.1f} mL/min")
+        
+        # Display renal function category
+        if crcl >= 90:
+            renal_function = "Normal"
+        elif crcl >= 60:
+            renal_function = "Mild Impairment"
+        elif crcl >= 30:
+            renal_function = "Moderate Impairment"
+        elif crcl >= 15:
+            renal_function = "Severe Impairment"
+        else:
+            renal_function = "Kidney Failure"
+        
+        st.info(f"Renal Function: {renal_function}")
 
-# Calculate Cockcroft-Gault Creatinine Clearance
-with st.sidebar.expander("Creatinine Clearance (Cockcroft-Gault)", expanded=True):
-    # Calculate creatinine clearance using Cockcroft-Gault formula
-    crcl = ((140 - age) * weight * (1.23 if gender == "Male" else 1.04)) / serum_cr
-    st.success(f"CrCl: {crcl:.1f} mL/min")
+    st.sidebar.title("🩺 Clinical Information")
+    clinical_diagnosis = st.sidebar.text_input("Diagnosis")
+    current_dose_regimen = st.sidebar.text_area("Current Dosing Regimen", value="1g IV q12h")
+    notes = st.sidebar.text_area("Other Clinical Notes", value="No known allergies.")
+    clinical_summary = f"Diagnosis: {clinical_diagnosis}\nRenal function: {renal_function} (CrCl: {crcl:.1f} mL/min)\nCurrent regimen: {current_dose_regimen}\nNotes: {notes}"
     
-    # Display renal function category
-    if crcl >= 90:
-        renal_function = "Normal"
-    elif crcl >= 60:
-        renal_function = "Mild Impairment"
-    elif crcl >= 30:
-        renal_function = "Moderate Impairment"
-    elif crcl >= 15:
-        renal_function = "Severe Impairment"
-    else:
-        renal_function = "Kidney Failure"
+    st.sidebar.markdown("---")
+    st.sidebar.info("""
+    **Antimicrobial TDM App v1.0**
     
-    st.info(f"Renal Function: {renal_function}")
+    Developed for therapeutic drug monitoring of antimicrobials.
+    
+    This app provides population PK estimates, AUC calculations, and dosing recommendations
+    for vancomycin and aminoglycosides based on current best practices.
+    
+    **Disclaimer:** This tool is designed to assist clinical decision making but does not replace
+    professional judgment. Always consult with a clinical pharmacist for complex cases.
+    """)
 
-st.sidebar.title("🩺 Clinical Information")
-clinical_diagnosis = st.sidebar.text_input("Diagnosis")
-current_dose_regimen = st.sidebar.text_area("Current Dosing Regimen", value="1g IV q12h")
-notes = st.sidebar.text_area("Other Clinical Notes", value="No known allergies.")
-clinical_summary = f"Diagnosis: {clinical_diagnosis}\nRenal function: {renal_function} (CrCl: {crcl:.1f} mL/min)\nCurrent regimen: {current_dose_regimen}\nNotes: {notes}"
-
-# ===== MODULE 1: Aminoglycoside Initial Dose =====
-if page == "Aminoglycoside: Initial Dose":
+    # Return all the data entered in the sidebar
+    return {
+        'page': page,
+        'gender': gender,
+        'age': age,
+        'height': height,
+        'weight': weight,
+        'serum_cr': serum_cr,
+        'crcl': crcl,
+        'renal_function': renal_function,
+        'clinical_diagnosis': clinical_diagnosis,
+        'current_dose_regimen': current_dose_regimen,
+        'notes': notes,
+        'clinical_summary': clinical_summary
+    }
+    # ===== MODULE 1: Aminoglycoside Initial Dose =====
+def aminoglycoside_initial_dose(patient_data):
     st.title("🧮 Aminoglycoside Initial Dose (Population PK)")
+    
+    # Unpack patient data for easier access
+    gender = patient_data['gender']
+    age = patient_data['age']
+    height = patient_data['height']
+    weight = patient_data['weight']
+    crcl = patient_data['crcl']
+    notes = patient_data['notes']
+    
     # We'll use demographic data already entered in the sidebar
     drug = st.selectbox("Drug", ["Gentamicin", "Amikacin"])
     
@@ -601,7 +696,8 @@ if page == "Aminoglycoside: Initial Dose":
     
     st.success(f"Recommended Initial Dose: **{practical_dose:.0f} mg** every **{tau:.0f}** hours")
     st.info(f"Expected Cmax: **{expected_cmax:.2f} mg/L**, Expected Cmin: **{expected_cmin:.2f} mg/L**")
-# Additional suggestions for loading dose
+    
+    # Additional suggestions for loading dose
     if regimen == "SDD" or (is_hd and expected_cmax < target_cmax * 0.9):
         loading_dose = target_cmax * vd
         st.warning(f"Consider loading dose of **{round(loading_dose/10)*10:.0f} mg** to rapidly achieve target peak concentration.")
@@ -625,16 +721,16 @@ if page == "Aminoglycoside: Initial Dose":
         st.altair_chart(chart, use_container_width=True)
 
     if st.button("🧠 Interpret with LLM"):
-        prompt = (f"Aminoglycoside Initial Dose: Patient: {age} y/o {gender.lower()}, {height} cm, {weight} kg, SCr: {serum_cr} µmol/L. "
+        prompt = (f"Aminoglycoside Initial Dose: Patient: {age} y/o {gender.lower()}, {height} cm, {weight} kg, SCr: {patient_data['serum_cr']} µmol/L. "
                   f"Drug: {drug}, Regimen: {regimen}, Target Cmax: {target_cmax}, Target Cmin: {target_cmin}, Interval: {tau} hr. "
                   f"Calculated: Weight {dosing_weight:.2f} kg ({weight_used}), Vd {vd:.2f} L, CrCl {crcl:.2f} mL/min, "
                   f"Ke {ke:.3f} hr⁻¹, t1/2 {t_half:.2f} hr, Dose {practical_dose:.0f} mg. "
                   f"Expected Cmax {expected_cmax:.2f} mg/L, Expected Cmin {expected_cmin:.2f} mg/L.")
         interpret_with_llm(prompt)
-
-# ===== MODULE 2: Aminoglycoside Conventional Dosing (C1/C2) =====
-elif page == "Aminoglycoside: Conventional Dosing (C1/C2)":
+        # ===== MODULE 2: Aminoglycoside Conventional Dosing (C1/C2) =====
+def aminoglycoside_conventional_dosing(patient_data):
     st.title("📊 Aminoglycoside Adjustment using C1/C2")
+    
     drug = st.selectbox("Select Drug", ["Gentamicin", "Amikacin"])
     regimen = st.selectbox("Therapeutic Goal", ["MDD", "SDD", "Synergy", "Hemodialysis", "Neonates"])
 
@@ -777,10 +873,16 @@ elif page == "Aminoglycoside: Conventional Dosing (C1/C2)":
             st.error("❌ C1 and C2 must be greater than 0 to perform calculations.")
     except Exception as e:
         st.error(f"Calculation error: {e}")
-
-# ===== MODULE 3: Vancomycin AUC-based Dosing =====
-elif page == "Vancomycin AUC-based Dosing":
+        # ===== MODULE 3: Vancomycin AUC-based Dosing =====
+def vancomycin_auc_dosing(patient_data):
     st.title("🧪 Vancomycin AUC-Based Dosing")
+    
+    # Unpack patient data for easier access
+    weight = patient_data['weight']
+    crcl = patient_data['crcl']
+    gender = patient_data['gender']
+    age = patient_data['age']
+    
     method = st.radio("Select Method", ["Trough only", "Peak and Trough"], horizontal=True)
     
     # Global trough target selection (shown regardless of method)
@@ -867,9 +969,12 @@ elif page == "Vancomycin AUC-based Dosing":
         if has_measured_trough:
             st.markdown(f"Measured Trough: **{measured_trough:.1f} mg/L**")
         else:
+            st.markdown(f"Estimate
+            if has_measured_trough:
+            st.markdown(f"Measured Trough: **{measured_trough:.1f} mg/L**")
+        else:
             st.markdown(f"Estimated Trough: **{estimated_trough:.1f} mg/L**")
         
-        # The rest of the code remains the same...
         # Enhanced suggest_adjustment with practical dosing recommendations
         trough_to_check = measured_trough if has_measured_trough else estimated_trough
         
@@ -1069,9 +1174,10 @@ elif page == "Vancomycin AUC-based Dosing":
                 else:
                     st.info(f"🔹 {dose:.0f}mg q{interval}h (Est. trough: {expected_trough:.1f}, AUC: {expected_auc:.1f})")
             
-            # Add bayesian estimation option
-            add_bayesian_estimation_ui()
-
+            # Add bayesian estimation option if available
+            if BAYESIAN_AVAILABLE:
+                add_bayesian_estimation_ui()
+            
             # Add visualization option
             if st.checkbox("Show concentration-time curve"):
                 chart = plot_concentration_time_curve(
@@ -1092,159 +1198,21 @@ elif page == "Vancomycin AUC-based Dosing":
                 interpret_with_llm(prompt)
         except Exception as e:
             st.error(f"Calculation error: {e}")
+            # ===== MAIN APPLICATION CODE =====
+def main():
+    # Set up sidebar and get patient data
+    patient_data = setup_sidebar_and_navigation()
+    
+    # Route to appropriate module based on selected page
+    if patient_data['page'] == "Aminoglycoside: Initial Dose":
+        aminoglycoside_initial_dose(patient_data)
+    elif patient_data['page'] == "Aminoglycoside: Conventional Dosing (C1/C2)":
+        aminoglycoside_conventional_dosing(patient_data)
+    elif patient_data['page'] == "Vancomycin AUC-based Dosing":
+        vancomycin_auc_dosing(patient_data)
+    else:
+        st.error(f"Unknown page: {patient_data['page']}")
 
-# ===== BAYESIAN ANALYSIS UI FUNCTION =====
-def add_bayesian_estimation_ui():
-    with st.expander("🧠 Bayesian Parameter Estimation", expanded=False):
-        st.markdown("""
-        ### Multiple Level Bayesian Analysis
-        Enter multiple concentration measurements to improve parameter estimates using Bayesian methods.
-        """)
-        
-        # Create input for multiple measurements
-        num_measurements = st.number_input("Number of measurements", min_value=1, max_value=10, value=2)
-        
-        measurements = []
-        for i in range(num_measurements):
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                conc = st.number_input(f"Concentration #{i+1} (mg/L)", min_value=0.0, key=f"conc_{i}")
-            with col2:
-                time = st.number_input(f"Time after dose #{i+1} (hr)", min_value=0.0, key=f"time_{i}")
-            with col3:
-                is_trough = st.checkbox(f"Is trough?", key=f"is_trough_{i}")
-            
-            measurements.append({
-                'concentration': conc,
-                'time': time,
-                'is_trough': is_trough
-            })
-            
-        if st.button("Run Bayesian Analysis"):
-            try:
-                # Extract data for analysis
-                measured_levels = [m['concentration'] for m in measurements if m['concentration'] > 0]
-                sample_times = [m['time'] for m in measurements if m['concentration'] > 0]
-                
-                if len(measured_levels) < 2:
-                    st.error("⚠️ At least 2 valid measurements are required for Bayesian analysis.")
-                    return
-                
-                # Run Bayesian estimation
-                params = bayesian_parameter_estimation(
-                    measured_levels=measured_levels,
-                    sample_times=sample_times,
-                    dose=current_dose/(24/tau), # convert TDD to dose per interval
-                    tau=tau,
-                    weight=weight,
-                    age=age,
-                    crcl=crcl,
-                    gender=gender
-                )
-                
-                if params['optimization_success']:
-                    st.success("✅ Bayesian analysis completed successfully!")
-                    
-                    # Display estimated parameters
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric("Volume of Distribution", f"{params['vd']:.2f} L/kg")
-                        st.metric("Total Vd", f"{params['vd_total']:.2f} L")
-                    with col2:
-                        st.metric("Elimination Rate (Ke)", f"{params['ke']:.4f} hr⁻¹")
-                        st.metric("Half-life", f"{params['t_half']:.2f} hr")
-                    
-                    # Calculate AUC with Bayesian parameters
-                    single_dose = current_dose/(24/tau)
-                    bayesian_auc_tau = single_dose / params['cl']
-                    bayesian_auc24 = bayesian_auc_tau * (24/tau)
-                    
-                    st.info(f"Bayesian AUC24: {bayesian_auc24:.1f} mg·hr/L")
-                    
-                    # Calculate optimal dose
-                    target_auc24 = 500  # middle of 400-600 range
-                    optimal_daily_dose = current_dose * (target_auc24 / bayesian_auc24)
-                    
-                    st.success(f"Recommended dose based on Bayesian analysis: {optimal_daily_dose:.0f} mg/day")
-                    
-                    # Simulate concentration-time curve with Bayesian parameters
-                    times = np.linspace(0, tau*2, 200)
-                    concentrations = []
-                    
-                    for t in times:
-                        interval = int(t / tau)
-                        t_in_interval = t % tau
-                        
-                        conc = 0
-                        for i in range(interval + 1):
-                            t_after_dose = t - i * tau
-                            if t_after_dose > 0:
-                                if t_after_dose <= 1:  # During 1-hour infusion
-                                    peak_conc = single_dose / params['vd_total']
-                                    conc += peak_conc * (t_after_dose / 1)
-                                else:  # After infusion
-                                    peak_conc = single_dose / params['vd_total']
-                                    conc += peak_conc * np.exp(-params['ke'] * (t_after_dose - 1))
-                        
-                        concentrations.append(conc)
-                    
-                    # Plot the predicted curve
-                    df = pd.DataFrame({
-                        'Time (hr)': times,
-                        'Concentration (mg/L)': concentrations
-                    })
-                    
-                    # Add measured data points to plot
-                    measured_df = pd.DataFrame({
-                        'Time (hr)': sample_times,
-                        'Concentration (mg/L)': measured_levels
-                    })
-                    
-                    chart = alt.Chart(df).mark_line().encode(
-                        x='Time (hr)',
-                        y='Concentration (mg/L)'
-                    )
-                    
-                    points = alt.Chart(measured_df).mark_circle(size=100).encode(
-                        x='Time (hr)',
-                        y='Concentration (mg/L)',
-                        tooltip=['Time (hr)', 'Concentration (mg/L)']
-                    )
-                    
-                    # Add vertical lines for key time points
-                    next_dose = alt.Chart(pd.DataFrame({'x': [tau]})).mark_rule(
-                        strokeDash=[5, 5], color='red'
-                    ).encode(x='x')
-                    
-                    # Combine charts
-                    combined_chart = alt.layer(
-                        chart, 
-                        points,
-                        next_dose
-                    ).properties(
-                        width=600,
-                        height=400,
-                        title='Bayesian Predicted Concentration-Time Profile'
-                    )
-                    
-                    st.altair_chart(combined_chart, use_container_width=True)
-                    
-                else:
-                    st.error("⚠️ Bayesian optimization failed to converge. Try different measurements.")
-            except Exception as e:
-                st.error(f"Error in Bayesian analysis: {e}")
-
-# Run the app!
+# Run the application
 if __name__ == "__main__":
-    st.sidebar.markdown("---")
-    st.sidebar.info("""
-    **Antimicrobial TDM App v1.0**
-    
-    Developed for therapeutic drug monitoring of antimicrobials.
-    
-    This app provides population PK estimates, AUC calculations, and dosing recommendations
-    for vancomycin and aminoglycosides based on current best practices.
-    
-    **Disclaimer:** This tool is designed to assist clinical decision making but does not replace
-    professional judgment. Always consult with a clinical pharmacist for complex cases.
-    """)
+    main()
