@@ -873,7 +873,7 @@ def aminoglycoside_conventional_dosing(patient_data):
             st.error("❌ C1 and C2 must be greater than 0 to perform calculations.")
     except Exception as e:
         st.error(f"Calculation error: {e}")
-      # ===== MODULE 3: Vancomycin AUC-based Dosing =====
+     # ===== MODULE 3: Vancomycin AUC-based Dosing =====
 def vancomycin_auc_dosing(patient_data):
     st.title("🧪 Vancomycin AUC-Based Dosing")
     
@@ -887,25 +887,22 @@ def vancomycin_auc_dosing(patient_data):
     
     # Global trough target selection (shown regardless of method)
     target_trough_strategy = st.selectbox(
-        "Select Trough Target Strategy", 
+        "Select Target Strategy", 
         ["Empirical (10-15 mg/L)", "Definitive (15-20 mg/L)"]
     )
+    
+    # Set targets based on selected strategy
     if "Empirical" in target_trough_strategy:
         target_cmin = (10, 15)
+        target_peak = (20, 30) # Empirical peak targets
     else:
         target_cmin = (15, 20)
+        target_peak = (30, 40) # Definitive peak targets
+    
     st.markdown(f"**Target Trough Range:** {target_cmin[0]} - {target_cmin[1]} mg/L")
     
-    # For Peak and Trough method, add an extra dropdown for peak target
+    # Only show peak targets for Peak and Trough method
     if method == "Peak and Trough":
-        peak_target_selection = st.selectbox(
-            "Select Peak Target Strategy", 
-            ["Empirical (20-30 mg/L)", "Definitive (30-40 mg/L)"]
-        )
-        if "Empirical" in peak_target_selection:
-            target_peak = (20, 30)
-        else:
-            target_peak = (30, 40)
         st.markdown(f"**Target Peak Range:** {target_peak[0]} - {target_peak[1]} mg/L")
     
     # Already have weight from sidebar
@@ -1131,11 +1128,11 @@ def vancomycin_auc_dosing(patient_data):
                 st.success(f"✅ Trough is within target range ({trough:.1f} mg/L).")
             
             # Enhanced suggestions for peak
-            if method == "Peak and Trough" and peak < target_peak[0]:
+            if peak < target_peak[0]:
                 st.warning(f"⚠️ Peak is low ({peak:.1f} mg/L). Target: {target_peak[0]}-{target_peak[1]} mg/L")
-            elif method == "Peak and Trough" and peak > target_peak[1]:
+            elif peak > target_peak[1]:
                 st.warning(f"⚠️ Peak is high ({peak:.1f} mg/L). Target: {target_peak[0]}-{target_peak[1]} mg/L")
-            elif method == "Peak and Trough":
+            else:
                 st.success(f"✅ Peak is within target range ({peak:.1f} mg/L).")
             
             # AUC check
