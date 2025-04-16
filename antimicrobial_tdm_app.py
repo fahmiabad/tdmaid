@@ -276,7 +276,7 @@ def bayesian_parameter_estimation(measured_levels, sample_times, dose, tau, weig
         't_half': t_half_opt,
         'optimization_success': result.success
     }
-    # ===== INTERPRETATION FUNCTION =====
+   # ===== INTERPRETATION FUNCTION =====
 def interpret_with_llm(prompt):
     """
     Enhanced clinical interpretation function for antimicrobial TDM
@@ -287,8 +287,8 @@ def interpret_with_llm(prompt):
     # Check if OpenAI API is available and configured
     if OPENAI_AVAILABLE and openai.api_key:
         try:
-            # Call OpenAI API - uncomment and modify as needed
-            response = openai.ChatCompletion.create(
+            # Call OpenAI API - updated for openai v1.0.0+
+            response = openai.chat.completions.create(
                 model="gpt-4",  # or your preferred model
                 messages=[
                     {"role": "system", "content": "You are an expert clinical pharmacist specializing in therapeutic drug monitoring. Provide concise, evidence-based interpretations with clear recommendations."},
@@ -326,11 +326,11 @@ def interpret_with_llm(prompt):
         target_range = None
         
         # Parse for measured or estimated trough
-        if "Measured trough" in prompt:
+        if "Measured trough = " in prompt:
             parts = prompt.split("Measured trough = ")
             if len(parts) > 1:
                 trough_val = float(parts[1].split()[0])
-        elif "Estimated trough" in prompt:
+        elif "Estimated trough = " in prompt:
             parts = prompt.split("Estimated trough = ")
             if len(parts) > 1:
                 trough_val = float(parts[1].split()[0])
@@ -345,10 +345,32 @@ def interpret_with_llm(prompt):
         if "Target trough range = " in prompt:
             parts = prompt.split("Target trough range = ")
             if len(parts) > 1:
-                target_range = parts[1].strip()
+                range_str = parts[1].strip()
+                # Extract numbers from range
+                import re
+                numbers = re.findall(r'\d+', range_str)
+                if len(numbers) >= 2:
+                    target_min = int(numbers[0])
+                    target_max = int(numbers[1])
+                    target_range = f"{target_min}-{target_max} mg/L"
+                else:
+                    target_range = range_str
         
         # Create a styled interpretation
-        if trough_val is not None and auc_val is not None:
+        if trough_val is not None and auc_val is not None and target_range is not None:
+            # Get target trough values
+            target_parts = target_range.split("-")
+            if len(target_parts) == 2:
+                try:
+                    target_min = float(target_parts[0])
+                    target_max = float(target_parts[1].split()[0])  # Extract number before unit
+                except ValueError:
+                    target_min = 10
+                    target_max = 20
+            else:
+                target_min = 10
+                target_max = 20
+            
             # Create columns for Key Findings and Clinical Recommendations
             col1, col2 = st.columns(2)
             
@@ -364,22 +386,21 @@ def interpret_with_llm(prompt):
                 else:
                     st.markdown("• **AUC:24 is therapeutic** at {:.1f} mg·hr/L (target: 400-600)".format(auc_val))
                 
-                # Trough analysis
-                if trough_val < 10:
+                # Trough analysis - Corrected logic to properly check against target range
+                if trough_val < target_min:
                     st.markdown("• **Trough is subtherapeutic** at {:.1f} mg/L (target: {})".format(trough_val, target_range))
-                elif trough_val > 20:
-                    st.markdown("• **Trough is significantly elevated** at {:.1f} mg/L (target: {})".format(trough_val, target_range))
-                    st.markdown("• **High risk of nephrotoxicity** with continued exposure to these levels")
-                elif trough_val > 15:
-                    st.markdown("• **Trough is mildly elevated** at {:.1f} mg/L (target: {})".format(trough_val, target_range))
-                else:
+                elif trough_val > target_max:
+                    st.markdown("• **Trough is supratherapeutic** at {:.1f} mg/L (target: {})".format(trough_val, target_range))
+                    if trough_val > 20:
+                        st.markdown("• **High risk of nephrotoxicity** with continued exposure to these levels")
+                elif target_min <= trough_val <= target_max:
                     st.markdown("• **Trough is therapeutic** at {:.1f} mg/L (target: {})".format(trough_val, target_range))
             
             with col2:
                 st.markdown("#### Clinical Recommendations:")
                 
                 # Generate dosing recommendations based on AUC and trough
-                if auc_val < 400 and trough_val < 10:
+                if auc_val < 400 and trough_val < target_min:
                     st.markdown("• **Increase dose** and consider shortening interval")
                     st.markdown("• **Consider loading dose** of 25-30 mg/kg if severe infection")
                     st.markdown("• Recheck levels after 3 doses (steady state)")
@@ -395,6 +416,14 @@ def interpret_with_llm(prompt):
                 elif auc_val < 400:
                     st.markdown("• **Increase dose** by approximately 15-20%")
                     st.markdown("• Recheck levels after 3 doses")
+                elif trough_val < target_min:
+                    st.markdown("• **Increase dose** to achieve target trough of {}-{} mg/L".format(target_min, target_max))
+                    st.markdown("• AUC is therapeutic, but trough is below target")
+                    st.markdown("• Consider shorter dosing interval")
+                elif trough_val > target_max:
+                    st.markdown("• **Decrease dose** to achieve target trough of {}-{} mg/L".format(target_min, target_max))
+                    st.markdown("• AUC is therapeutic, but trough is above target")
+                    st.markdown("• Consider longer dosing interval")
                 else:
                     st.markdown("• **Continue current regimen**")
                     st.markdown("• Reassess need for continued TDM based on clinical response")
@@ -478,6 +507,7 @@ def interpret_with_llm(prompt):
         
     # Add note about simulated response
     st.info("Simulated interpretation. For production use, configure OpenAI API in Streamlit secrets.toml")
+    
     # ===== SIDEBAR: NAVIGATION AND PATIENT INFO =====
 def setup_sidebar_and_navigation():
     st.sidebar.title("📊 Navigation")
