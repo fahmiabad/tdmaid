@@ -1,5 +1,6 @@
 streamlit
-openai
-faiss-cpu
-PyPDF2
-tiktoken
+numpy
+pandas
+altair
+openai>=1.0.0
+reportlab
