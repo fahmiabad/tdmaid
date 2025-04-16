@@ -1,14 +1,16 @@
-"""
-ANTIMICROBIAL TDM APP - COMPLETE IMPLEMENTATION
-This is the complete implementation with the improved clinical recommendations formatting.
-"""
-
 import streamlit as st
 import numpy as np
 import math
 import openai
 import pandas as pd
 import altair as alt
+import base64
+from datetime import datetime
+import io
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
 # Optional imports - Bayesian functionality
 try:
@@ -64,6 +66,7 @@ if FAISS_AVAILABLE:
 
 # ===== Global Practical Dosing Regimens =====
 practical_intervals = "6hr, 8hr, 12hr, 24hr, every other day"
+
 # ===== HELPER FUNCTION: Updated Practical Dose Adjustment =====
 def suggest_adjustment(parameter, target_min, target_max, label="Parameter", intervals=practical_intervals):
     if parameter < target_min:
@@ -72,6 +75,242 @@ def suggest_adjustment(parameter, target_min, target_max, label="Parameter", int
         st.warning(f"⚠️ {label} is high. Consider reducing the dose or lengthening the interval to a practical regimen ({intervals}).")
     else:
         st.success(f"✅ {label} is within target range.")
+
+# ===== PDF GENERATION FUNCTIONS =====
+def create_recommendation_pdf(patient_data, drug_info, levels_data, assessment, dosing_recs, monitoring_recs, cautions=None):
+    """
+    Create a downloadable PDF with the clinical recommendations
+    
+    Parameters:
+    - patient_data: Dictionary with patient information
+    - drug_info: String with drug name and method
+    - levels_data: List of tuples (name, value, target, status) for each measured level
+    - assessment: Overall assessment string
+    - dosing_recs: List of dosing recommendation strings
+    - monitoring_recs: List of monitoring recommendation strings
+    - cautions: Optional list of caution strings
+    
+    Returns:
+    - base64 encoded PDF for download
+    """
+    # Create an in-memory PDF
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=72, leftMargin=72, topMargin=72, bottomMargin=72)
+    
+    # Create styles
+    styles = getSampleStyleSheet()
+    title_style = styles['Heading1']
+    heading_style = styles['Heading2']
+    normal_style = styles['Normal']
+    
+    # Create custom styles
+    section_style = ParagraphStyle(
+        'SectionStyle',
+        parent=styles['Heading3'],
+        spaceAfter=6,
+        textColor=colors.navy
+    )
+    
+    # Create the content
+    content = []
+    
+    # Add report title
+    content.append(Paragraph("Antimicrobial TDM Report", title_style))
+    content.append(Spacer(1, 12))
+    
+    # Add date and time
+    now = datetime.now()
+    content.append(Paragraph(f"Report Generated: {now.strftime('%Y-%m-%d %H:%M')}", normal_style))
+    content.append(Spacer(1, 12))
+    
+    # Add patient information
+    content.append(Paragraph("Patient Information", heading_style))
+    
+    # Create patient info table
+    patient_info = []
+    
+    # First row
+    patient_info.append([
+        Paragraph("<b>Age:</b>", normal_style),
+        Paragraph(f"{patient_data.get('age', 'N/A')} years", normal_style),
+        Paragraph("<b>Gender:</b>", normal_style),
+        Paragraph(f"{patient_data.get('gender', 'N/A')}", normal_style)
+    ])
+    
+    # Second row
+    patient_info.append([
+        Paragraph("<b>Weight:</b>", normal_style),
+        Paragraph(f"{patient_data.get('weight', 'N/A')} kg", normal_style),
+        Paragraph("<b>Height:</b>", normal_style),
+        Paragraph(f"{patient_data.get('height', 'N/A')} cm", normal_style)
+    ])
+    
+    # Third row
+    patient_info.append([
+        Paragraph("<b>Serum Creatinine:</b>", normal_style),
+        Paragraph(f"{patient_data.get('serum_cr', 'N/A')} µmol/L", normal_style),
+        Paragraph("<b>CrCl:</b>", normal_style),
+        Paragraph(f"{patient_data.get('crcl', 'N/A'):.1f} mL/min", normal_style)
+    ])
+    
+    # Fourth row with diagnosis spanning full width
+    patient_info.append([
+        Paragraph("<b>Diagnosis:</b>", normal_style),
+        Paragraph(f"{patient_data.get('clinical_diagnosis', 'N/A')}", normal_style),
+        Paragraph("<b>Renal Function:</b>", normal_style),
+        Paragraph(f"{patient_data.get('renal_function', 'N/A')}", normal_style)
+    ])
+    
+    # Fifth row with notes spanning full width
+    patient_info.append([
+        Paragraph("<b>Current Regimen:</b>", normal_style),
+        Paragraph(f"{patient_data.get('current_dose_regimen', 'N/A')}", normal_style),
+        Paragraph("", normal_style),
+        Paragraph("", normal_style)
+    ])
+    
+    # Create the table
+    patient_table = Table(patient_info, colWidths=[100, 150, 100, 150])
+    patient_table.setStyle(TableStyle([
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
+        ('BACKGROUND', (2, 0), (2, -1), colors.lightgrey),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    ]))
+    
+    content.append(patient_table)
+    content.append(Spacer(1, 12))
+    
+    # Add drug information
+    content.append(Paragraph("Drug Information", heading_style))
+    content.append(Paragraph(drug_info, normal_style))
+    content.append(Spacer(1, 12))
+    
+    # Add clinical assessment
+    content.append(Paragraph("Clinical Assessment", heading_style))
+    
+    # Add measured levels
+    content.append(Paragraph("Measured Levels:", section_style))
+    
+    # Create levels table
+    levels_table_data = [["Parameter", "Value", "Target Range", "Status"]]
+    
+    for name, value, target, status in levels_data:
+        # Determine status text and color
+        if status == "within":
+            status_text = "Within Range"
+            status_color = colors.green
+        elif status == "below":
+            status_text = "Below Range"
+            status_color = colors.orange
+        else:  # above
+            status_text = "Above Range"
+            status_color = colors.red
+        
+        levels_table_data.append([name, value, target, status_text])
+    
+    levels_table = Table(levels_table_data)
+    levels_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    ]))
+    
+    # Add status color to each row in the table
+    for i, (_, _, _, status) in enumerate(levels_data, 1):
+        if status == "within":
+            color = colors.lightgreen
+        elif status == "below":
+            color = colors.lightyellow
+        else:  # above
+            color = colors.mistyrose
+        
+        levels_table.setStyle(TableStyle([
+            ('BACKGROUND', (3, i), (3, i), color),
+        ]))
+    
+    content.append(levels_table)
+    content.append(Spacer(1, 8))
+    
+    # Add assessment
+    content.append(Paragraph("Assessment:", section_style))
+    content.append(Paragraph(f"Patient is {assessment.upper()}", normal_style))
+    content.append(Spacer(1, 12))
+    
+    # Add recommendations
+    content.append(Paragraph("Recommendations", heading_style))
+    
+    # Add dosing recommendations
+    content.append(Paragraph("Dosing:", section_style))
+    for rec in dosing_recs:
+        content.append(Paragraph(f"• {rec}", normal_style))
+    content.append(Spacer(1, 8))
+    
+    # Add monitoring recommendations
+    content.append(Paragraph("Monitoring:", section_style))
+    for rec in monitoring_recs:
+        content.append(Paragraph(f"• {rec}", normal_style))
+    content.append(Spacer(1, 8))
+    
+    # Add cautions if any
+    if cautions and len(cautions) > 0:
+        content.append(Paragraph("Cautions:", section_style))
+        for caution in cautions:
+            content.append(Paragraph(f"• {caution}", normal_style))
+    
+    # Add disclaimer
+    content.append(Spacer(1, 20))
+    disclaimer_style = ParagraphStyle(
+        'Disclaimer',
+        parent=normal_style,
+        fontSize=8,
+        textColor=colors.grey
+    )
+    content.append(Paragraph("Disclaimer: This report is generated by an automated system and is intended to assist clinical decision making. Always use professional judgment when implementing recommendations.", disclaimer_style))
+    
+    # Build the PDF
+    doc.build(content)
+    
+    # Get the PDF value from the buffer
+    pdf_value = buffer.getvalue()
+    buffer.close()
+    
+    # Encode the PDF to base64
+    pdf_base64 = base64.b64encode(pdf_value).decode()
+    
+    return pdf_base64
+
+# Function to create a download link for the PDF
+def get_pdf_download_link(pdf_base64, filename="clinical_recommendations.pdf"):
+    """Create a download link for a base64 encoded PDF"""
+    href = f'<a href="data:application/pdf;base64,{pdf_base64}" download="{filename}">Download Clinical Recommendations PDF</a>'
+    return href
+
+# Display a button to download the clinical recommendations as a PDF
+def display_pdf_download_button(patient_data, drug_info, levels_data, assessment, dosing_recs, monitoring_recs, cautions=None):
+    """
+    Display a button to download the clinical recommendations as a PDF
+    """
+    if st.button("📄 Print/Save Recommendations"):
+        # Generate the PDF
+        pdf_base64 = create_recommendation_pdf(
+            patient_data, 
+            drug_info, 
+            levels_data, 
+            assessment, 
+            dosing_recs, 
+            monitoring_recs, 
+            cautions
+        )
+        
+        # Create the download link
+        download_link = get_pdf_download_link(pdf_base64)
+        
+        # Display the download link
+        st.markdown(download_link, unsafe_allow_html=True)
+        
+        # Preview message
+        st.success("PDF generated successfully. Click the link above to download.")
 
 # ===== CONCENTRATION-TIME CURVE VISUALIZATION =====
 def plot_concentration_time_curve(peak, trough, ke, tau, t_peak=1.0, infusion_time=1.0):
@@ -284,13 +523,37 @@ def bayesian_parameter_estimation(measured_levels, sample_times, dose, tau, weig
     }
 
 # ===== IMPROVED CLINICAL INTERPRETATION FUNCTION =====
-def interpret_with_llm(prompt):
+def interpret_with_llm(prompt, patient_data=None):
     """
     Enhanced clinical interpretation function for antimicrobial TDM with improved recommendation formatting
+    and PDF printing capability
     
     This function can call the OpenAI API if configured, otherwise
     it will provide a simulated response with a standardized, clinically relevant format.
+    
+    Parameters:
+    - prompt: The clinical data prompt
+    - patient_data: Optional dictionary with patient information for PDF generation
     """
+    # Extract the drug type from the prompt
+    if "Vancomycin" in prompt:
+        drug = "Vancomycin"
+        if "Trough only" in prompt:
+            method = "Trough-only method"
+        else:
+            method = "Peak and Trough method"
+    elif "Aminoglycoside" in prompt:
+        drug = "Aminoglycoside"
+        if "Initial Dose" in prompt:
+            method = "Initial dosing"
+        else:
+            method = "Conventional (C1/C2) method"
+    else:
+        drug = "Antimicrobial"
+        method = "Standard method"
+    
+    drug_info = f"{drug} ({method})"
+    
     # Check if OpenAI API is available and configured
     if OPENAI_AVAILABLE and openai.api_key:
         try:
@@ -326,22 +589,40 @@ def interpret_with_llm(prompt):
             
             # Add a note about source
             st.info("Interpretation provided by OpenAI GPT-4. Always verify with clinical judgment.")
+            
+            # We can't easily extract the structured data from the LLM response for PDF generation
+            # So we'll skip the PDF option for the OpenAI path for now
             return
         except Exception as e:
             st.error(f"Error calling OpenAI API: {e}")
             st.warning("Falling back to simulated clinical interpretation.")
     
-    # Extract the drug type from the prompt
-    if "Vancomycin" in prompt:
-        drug = "Vancomycin"
-    elif "Aminoglycoside" in prompt:
-        drug = "Aminoglycoside"
-    else:
-        drug = "Antimicrobial"
-    
     # Format the standardized clinical interpretation
-    interpretation = generate_standardized_interpretation(prompt, drug)
-    st.write(interpretation)
+    interpretation_data = generate_standardized_interpretation(prompt, drug)
+    
+    # If the interpretation_data is a string (error message), just display it and return
+    if isinstance(interpretation_data, str):
+        st.write(interpretation_data)
+        return
+    
+    # Unpack the interpretation data
+    levels_data, assessment, dosing_recs, monitoring_recs, cautions = interpretation_data
+    
+    # Display the formatted interpretation
+    formatted_interpretation = format_clinical_recommendations(levels_data, assessment, dosing_recs, monitoring_recs, cautions)
+    st.write(formatted_interpretation)
+    
+    # Add the PDF download button if patient_data is provided
+    if patient_data:
+        display_pdf_download_button(
+            patient_data, 
+            drug_info, 
+            levels_data, 
+            assessment, 
+            dosing_recs, 
+            monitoring_recs, 
+            cautions
+        )
     
     # Add the raw prompt at the bottom for debugging
     with st.expander("Raw Analysis Data", expanded=False):
@@ -351,13 +632,31 @@ def interpret_with_llm(prompt):
     st.info("Simulated interpretation. For production use, configure OpenAI API in Streamlit secrets.toml")
 
 def generate_standardized_interpretation(prompt, drug):
-    """Generate a standardized interpretation based on drug type and prompt content"""
+    """
+    Generate a standardized interpretation based on drug type and prompt content
+    
+    Returns a tuple of:
+    - levels_data: List of tuples (name, value, target, status)
+    - assessment: String of assessment
+    - dosing_recs: List of dosing recommendations
+    - monitoring_recs: List of monitoring recommendations 
+    - cautions: List of cautions
+    
+    Or returns a string if insufficient data
+    """
     if drug == "Vancomycin":
         return generate_vancomycin_interpretation(prompt)
     elif drug == "Aminoglycoside":
         return generate_aminoglycoside_interpretation(prompt)
     else:
-        return generate_generic_interpretation(prompt)
+        # For generic, we'll create a simple placeholder
+        levels_data = [("Not available", "N/A", "N/A", "within")]
+        assessment = "requires specific assessment"
+        dosing_recs = ["CONSULT antimicrobial stewardship team", "FOLLOW institutional guidelines"]
+        monitoring_recs = ["OBTAIN appropriate levels based on antimicrobial type", "MONITOR renal function regularly"]
+        cautions = ["Patient-specific factors may require dose adjustments"]
+        
+        return levels_data, assessment, dosing_recs, monitoring_recs, cautions
 
 def format_clinical_recommendations(levels_data, assessment, dosing_recs, monitoring_recs, cautions=None):
     """
@@ -407,7 +706,18 @@ def format_clinical_recommendations(levels_data, assessment, dosing_recs, monito
     return output
 
 def generate_vancomycin_interpretation(prompt):
-    """Generate standardized vancomycin interpretation"""
+    """
+    Generate standardized vancomycin interpretation
+    
+    Returns a tuple of:
+    - levels_data: List of tuples (name, value, target, status)
+    - assessment: String of assessment
+    - dosing_recs: List of dosing recommendations
+    - monitoring_recs: List of monitoring recommendations 
+    - cautions: List of cautions
+    
+    Or returns a string if insufficient data
+    """
     # Extract key values from the prompt
     trough_val = None
     auc_val = None
@@ -636,12 +946,23 @@ def generate_vancomycin_interpretation(prompt):
         if crcl and crcl < 30:
             cautions.append("Increased risk of nephrotoxicity with severe renal impairment")
         
-        return format_clinical_recommendations(levels_data, status, dosing_recs, monitoring_recs, cautions)
+        return levels_data, status, dosing_recs, monitoring_recs, cautions
     
     return "Insufficient data to generate a clinical interpretation."
 
 def generate_aminoglycoside_interpretation(prompt):
-    """Generate standardized aminoglycoside interpretation"""
+    """
+    Generate standardized aminoglycoside interpretation
+    
+    Returns a tuple of:
+    - levels_data: List of tuples (name, value, target, status)
+    - assessment: String of assessment
+    - dosing_recs: List of dosing recommendations
+    - monitoring_recs: List of monitoring recommendations 
+    - cautions: List of cautions
+    
+    Or returns a string if insufficient data
+    """
     # Extract key values from the prompt
     drug_name = "aminoglycoside"
     peak_val = None
@@ -730,7 +1051,7 @@ def generate_aminoglycoside_interpretation(prompt):
         else:
             status = "requires adjustment"
     
-   # Format new dose
+    # Format new dose
     rounded_new_dose = None
     if new_dose:
         # Round to nearest 10mg for most aminoglycosides
@@ -821,34 +1142,9 @@ def generate_aminoglycoside_interpretation(prompt):
             if drug_name == "amikacin" or drug_name == "gentamicin":
                 cautions.append(f"Extended therapy (>7 days) increases toxicity risk")
         
-        return format_clinical_recommendations(levels_data, status, dosing_recs, monitoring_recs, cautions)
+        return levels_data, status, dosing_recs, monitoring_recs, cautions
     
     return "Insufficient data to generate a clinical interpretation."
-
-def generate_generic_interpretation(prompt):
-    """Generate a generic interpretation for other antimicrobials"""
-    # This is a placeholder for any other antimicrobial that might be added in the future
-    return """## CLINICAL ASSESSMENT
-
-📊 **MEASURED LEVELS:**
-- Insufficient data available
-
-⚕️ **ASSESSMENT:**
-Patient requires assessment with more specific data
-
-## RECOMMENDATIONS
-
-🔵 **DOSING:**
-- CONSULT antimicrobial stewardship team
-- FOLLOW institutional guidelines
-
-🔵 **MONITORING:**
-- OBTAIN appropriate levels based on antimicrobial type
-- MONITOR renal function regularly
-
-⚠️ **CAUTIONS:**
-- Patient-specific factors may require dose adjustments
-"""
 
 # ===== SIDEBAR: NAVIGATION AND PATIENT INFO =====
 def setup_sidebar_and_navigation():
@@ -1095,11 +1391,11 @@ def aminoglycoside_initial_dose(patient_data):
 
     if st.button("🧠 Interpret with LLM"):
         prompt = (f"Aminoglycoside Initial Dose: Patient: {age} y/o {gender.lower()}, {height} cm, {weight} kg, SCr: {patient_data['serum_cr']} µmol/L. "
-                  f"Drug: {drug}, Regimen: {regimen}, Target Cmax: {target_cmax}, Target Cmin: {target_cmin}, Interval: {tau} hr. "
+                 f"Drug: {drug}, Regimen: {regimen}, Target Cmax: {target_cmax}, Target Cmin: {target_cmin}, Interval: {tau} hr. "
                   f"Calculated: Weight {dosing_weight:.2f} kg ({weight_used}), Vd {vd:.2f} L, CrCl {crcl:.2f} mL/min, "
                   f"Ke {ke:.3f} hr⁻¹, t1/2 {t_half:.2f} hr, Dose {practical_dose:.0f} mg. "
                   f"Expected Cmax {expected_cmax:.2f} mg/L, Expected Cmin {expected_cmin:.2f} mg/L.")
-        interpret_with_llm(prompt)
+        interpret_with_llm(prompt, patient_data)
 
 # ===== MODULE 2: Aminoglycoside Conventional Dosing (C1/C2) =====
 def aminoglycoside_conventional_dosing(patient_data):
@@ -1242,7 +1538,7 @@ def aminoglycoside_conventional_dosing(patient_data):
                           f"Suggested new dose: {new_dose:.0f} mg.")
                 if regimen == "SDD":
                     prompt += f" MIC: {mic} mg/L, Target peak:MIC ratio: 10:1"
-                interpret_with_llm(prompt)
+                interpret_with_llm(prompt, patient_data)
         else:
             st.error("❌ C1 and C2 must be greater than 0 to perform calculations.")
     except Exception as e:
@@ -1289,7 +1585,7 @@ def vancomycin_auc_dosing(patient_data):
         # Use CrCl from sidebar calculations
         tau = st.number_input("Dosing Interval (hr)", value=12.0)
         
-       # Add measured trough input field
+        # Add measured trough input field
         measured_trough = st.number_input("Measured Trough Level (mg/L)", min_value=0.0, value=0.0)
         has_measured_trough = measured_trough > 0
         
@@ -1428,7 +1724,7 @@ def vancomycin_auc_dosing(patient_data):
                 f"AUC24 = {auc24:.1f} mg·hr/L, {trough_info}, "
                 f"Target trough range = {target_cmin[0]}-{target_cmin[1]} mg/L."
             )
-            interpret_with_llm(prompt)
+            interpret_with_llm(prompt, patient_data)
     
     else:  # Peak and Trough method
         peak = st.number_input("Measured Peak (mg/L)", min_value=0.0)
@@ -1542,10 +1838,6 @@ def vancomycin_auc_dosing(patient_data):
                 else:
                     st.info(f"🔹 {dose:.0f}mg q{interval}h (Est. trough: {expected_trough:.1f}, AUC: {expected_auc:.1f})")
             
-            # Add bayesian estimation option if available
-            if BAYESIAN_AVAILABLE:
-                add_bayesian_estimation_ui()
-            
             # Add visualization option
             if st.checkbox("Show concentration-time curve"):
                 chart = plot_concentration_time_curve(
@@ -1563,7 +1855,7 @@ def vancomycin_auc_dosing(patient_data):
                     f"Target trough range = {target_cmin[0]}-{target_cmin[1]} mg/L, "
                     f"Target peak range = {target_peak[0]}-{target_peak[1]} mg/L, Recommended base dose = {new_dose:.0f} mg."
                 )
-                interpret_with_llm(prompt)
+                interpret_with_llm(prompt, patient_data)
         except Exception as e:
             st.error(f"Calculation error: {e}")
 
