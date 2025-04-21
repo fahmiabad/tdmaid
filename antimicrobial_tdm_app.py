@@ -1,28 +1,16 @@
-# -*- coding: utf-8 -*-
-"""
-Streamlit App for Antimicrobial Therapeutic Drug Monitoring (TDM)
-"""
-
 import streamlit as st
 import numpy as np
 import math
+import openai
 import pandas as pd
 import altair as alt
 import base64
 from datetime import datetime
 import io
-import re # Import the re module for regular expressions
-
-# ReportLab for PDF Generation
-try:
-    from reportlab.lib.pagesizes import letter
-    from reportlab.lib import colors
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-    REPORTLAB_AVAILABLE = True
-except ImportError:
-    REPORTLAB_AVAILABLE = False
-    st.error("ReportLab library not found. PDF generation will be disabled. Install using: pip install reportlab")
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
 # Optional imports - Bayesian functionality
 try:
@@ -42,1452 +30,1850 @@ except ImportError:
     FAISS_AVAILABLE = False
     print("Warning: faiss not installed. Guideline embeddings will not be available.")
 
-# API Configuration - OpenAI
-try:
-    # Check for OpenAI API key
-    import openai
-    # Securely access the API key from streamlit secrets
-    # Ensure you have a secrets.toml file or configure in Streamlit Cloud:
-    # [.streamlit/secrets.toml]
-    # [openai]
-    # api_key = "sk-..."
-    openai.api_key = st.secrets["openai"]["api_key"]
-    OPENAI_AVAILABLE = True
-except (KeyError, AttributeError, ImportError):
-    OPENAI_AVAILABLE = False
-    st.warning("""
-    OpenAI API key not found or library not installed. LLM interpretation feature will use simulated responses.
-
-    To enable full LLM features:
-    1. Install the library: pip install openai
-    2. Create a file named '.streamlit/secrets.toml' with:
-       [openai]
-       api_key = "your-api-key"
-    3. Or in Streamlit Cloud, add the secret in the dashboard settings.
-    """)
-
-# Set page configuration
 st.set_page_config(page_title="Antimicrobial TDM App", layout="wide")
 
-# ===== PATIENT INFO SECTION =====
-def display_patient_info_section():
-    """Display and collect patient information"""
-    st.header("Patient Information")
+# ===== API CONFIGURATION =====
+# Securely access the API key from streamlit secrets
+try:
+    openai.api_key = st.secrets["openai"]["api_key"]
+    OPENAI_AVAILABLE = True
+except (KeyError, AttributeError):
+    OPENAI_AVAILABLE = False
+    st.warning("""
+    OpenAI API key not found in Streamlit secrets. LLM interpretation will not be available.
+    
+    To enable this feature:
+    1. Create a file named '.streamlit/secrets.toml' with:
+       [openai]
+       api_key = "your-api-key"
+    2. Or in Streamlit Cloud, add the secret in the dashboard
+    """)
 
-    # Create a 2x2 grid for patient info
-    col1, col2 = st.columns(2)
+# ===== LOAD EMBEDDED GUIDELINE =====
+@st.cache_resource
+def load_guideline_embeddings():
+    if not FAISS_AVAILABLE:
+        return None, ["FAISS not installed. Guideline embeddings not available."]
+    
+    # Replace this with your actual FAISS index and guideline chunks
+    index = faiss.IndexFlatL2(768)  # Dummy placeholder index
+    chunks = ["Guideline excerpt 1", "Guideline excerpt 2", "Guideline excerpt 3"]
+    return index, chunks
 
-    with col1:
-        # Input field for Patient ID - Check if this is visible
-        patient_id = st.text_input("Patient ID", help="Enter the patient's unique identifier")
-        age = st.number_input("Age (years)", min_value=0, max_value=120, value=60)
-        weight = st.number_input("Weight (kg)", min_value=10.0, max_value=300.0, value=70.0, step=0.1)
-        serum_cr = st.number_input("Serum Creatinine (μmol/L)", min_value=10, max_value=1000, value=80)
+guideline_index, guideline_chunks = None, []
+if FAISS_AVAILABLE:
+    guideline_index, guideline_chunks = load_guideline_embeddings()
 
-    with col2:
-        # Input field for Ward/Unit - Check if this is visible
-        ward = st.text_input("Ward/Unit", help="Enter the patient's current location")
-        gender = st.selectbox("Gender", ["Male", "Female"])
-        height = st.number_input("Height (cm)", min_value=40, max_value=250, value=170)
-        clinical_diagnosis = st.text_input("Clinical Diagnosis", "Sepsis")
+# ===== Global Practical Dosing Regimens =====
+practical_intervals = "6hr, 8hr, 12hr, 24hr, every other day"
 
-    # Calculate Creatinine Clearance
-    crcl = 0.0 # Default value
-    renal_function = "Unknown"
-    try:
-        if serum_cr > 0 and weight > 0 and age > 0:
-            scr_mg = serum_cr / 88.4  # Convert μmol/L to mg/dL
-            if gender == "Male":
-                crcl = ((140 - age) * weight) / (72 * scr_mg)
-            else:
-                crcl = ((140 - age) * weight * 0.85) / (72 * scr_mg)
+# ===== HELPER FUNCTION: Updated Practical Dose Adjustment =====
+def suggest_adjustment(parameter, target_min, target_max, label="Parameter", intervals=practical_intervals):
+    if parameter < target_min:
+        st.warning(f"⚠️ {label} is low. Consider increasing the dose or shortening the interval to a practical regimen ({intervals}).")
+    elif parameter > target_max:
+        st.warning(f"⚠️ {label} is high. Consider reducing the dose or lengthening the interval to a practical regimen ({intervals}).")
+    else:
+        st.success(f"✅ {label} is within target range.")
 
-            # Determine renal function category
-            if crcl >= 90:
-                renal_function = "Normal renal function"
-            elif crcl >= 60:
-                renal_function = "Mild renal impairment"
-            elif crcl >= 30:
-                renal_function = "Moderate renal impairment"
-            elif crcl >= 15:
-                renal_function = "Severe renal impairment"
-            else:
-                renal_function = "Renal failure"
-        else:
-             st.warning("Please enter valid Age, Weight, and Serum Creatinine for CrCl calculation.")
+# ===== PDF GENERATION FUNCTIONS =====
+def create_recommendation_pdf(patient_data, drug_info, levels_data, assessment, dosing_recs, monitoring_recs, cautions=None):
+    """
+    Create a downloadable PDF with the clinical recommendations
+    
+    Parameters:
+    - patient_data: Dictionary with patient information
+    - drug_info: String with drug name and method
+    - levels_data: List of tuples (name, value, target, status) for each measured level
+    - assessment: Overall assessment string
+    - dosing_recs: List of dosing recommendation strings
+    - monitoring_recs: List of monitoring recommendation strings
+    - cautions: Optional list of caution strings
+    
+    Returns:
+    - base64 encoded PDF for download
+    """
+    # Create an in-memory PDF
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=72, leftMargin=72, topMargin=72, bottomMargin=72)
+    
+    # Create styles
+    styles = getSampleStyleSheet()
+    title_style = styles['Heading1']
+    heading_style = styles['Heading2']
+    normal_style = styles['Normal']
+    
+    # Create custom styles
+    section_style = ParagraphStyle(
+        'SectionStyle',
+        parent=styles['Heading3'],
+        spaceAfter=6,
+        textColor=colors.navy
+    )
+    
+    # Create the content
+    content = []
+    
+    # Add report title
+    content.append(Paragraph("Antimicrobial TDM Report", title_style))
+    content.append(Spacer(1, 12))
+    
+    # Add date and time
+    now = datetime.now()
+    content.append(Paragraph(f"Report Generated: {now.strftime('%Y-%m-%d %H:%M')}", normal_style))
+    content.append(Spacer(1, 12))
+    
+    # Add patient information
+    content.append(Paragraph("Patient Information", heading_style))
+    
+    # Create patient info table
+    patient_info = []
+    
+    # First row
+    patient_info.append([
+        Paragraph("<b>Age:</b>", normal_style),
+        Paragraph(f"{patient_data.get('age', 'N/A')} years", normal_style),
+        Paragraph("<b>Gender:</b>", normal_style),
+        Paragraph(f"{patient_data.get('gender', 'N/A')}", normal_style)
+    ])
+    
+    # Second row
+    patient_info.append([
+        Paragraph("<b>Weight:</b>", normal_style),
+        Paragraph(f"{patient_data.get('weight', 'N/A')} kg", normal_style),
+        Paragraph("<b>Height:</b>", normal_style),
+        Paragraph(f"{patient_data.get('height', 'N/A')} cm", normal_style)
+    ])
+    
+    # Third row
+    patient_info.append([
+        Paragraph("<b>Serum Creatinine:</b>", normal_style),
+        Paragraph(f"{patient_data.get('serum_cr', 'N/A')} µmol/L", normal_style),
+        Paragraph("<b>CrCl:</b>", normal_style),
+        Paragraph(f"{patient_data.get('crcl', 'N/A'):.1f} mL/min", normal_style)
+    ])
+    
+    # Fourth row with diagnosis spanning full width
+    patient_info.append([
+        Paragraph("<b>Diagnosis:</b>", normal_style),
+        Paragraph(f"{patient_data.get('clinical_diagnosis', 'N/A')}", normal_style),
+        Paragraph("<b>Renal Function:</b>", normal_style),
+        Paragraph(f"{patient_data.get('renal_function', 'N/A')}", normal_style)
+    ])
+    
+    # Fifth row with notes spanning full width
+    patient_info.append([
+        Paragraph("<b>Current Regimen:</b>", normal_style),
+        Paragraph(f"{patient_data.get('current_dose_regimen', 'N/A')}", normal_style),
+        Paragraph("", normal_style),
+        Paragraph("", normal_style)
+    ])
+    
+    # Create the table
+    patient_table = Table(patient_info, colWidths=[100, 150, 100, 150])
+    patient_table.setStyle(TableStyle([
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
+        ('BACKGROUND', (2, 0), (2, -1), colors.lightgrey),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    ]))
+    
+    content.append(patient_table)
+    content.append(Spacer(1, 12))
+    
+    # Add drug information
+    content.append(Paragraph("Drug Information", heading_style))
+    content.append(Paragraph(drug_info, normal_style))
+    content.append(Spacer(1, 12))
+    
+    # Add clinical assessment
+    content.append(Paragraph("Clinical Assessment", heading_style))
+    
+    # Add measured levels
+    content.append(Paragraph("Measured Levels:", section_style))
+    
+    # Create levels table
+    levels_table_data = [["Parameter", "Value", "Target Range", "Status"]]
+    
+    for name, value, target, status in levels_data:
+        # Determine status text and color
+        if status == "within":
+            status_text = "Within Range"
+            status_color = colors.green
+        elif status == "below":
+            status_text = "Below Range"
+            status_color = colors.orange
+        else:  # above
+            status_text = "Above Range"
+            status_color = colors.red
+        
+        levels_table_data.append([name, value, target, status_text])
+    
+    levels_table = Table(levels_table_data)
+    levels_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    ]))
+    
+    # Add status color to each row in the table
+    for i, (_, _, _, status) in enumerate(levels_data, 1):
+        if status == "within":
+            color = colors.lightgreen
+        elif status == "below":
+            color = colors.lightyellow
+        else:  # above
+            color = colors.mistyrose
+        
+        levels_table.setStyle(TableStyle([
+            ('BACKGROUND', (3, i), (3, i), color),
+        ]))
+    
+    content.append(levels_table)
+    content.append(Spacer(1, 8))
+    
+    # Add assessment
+    content.append(Paragraph("Assessment:", section_style))
+    content.append(Paragraph(f"Patient is {assessment.upper()}", normal_style))
+    content.append(Spacer(1, 12))
+    
+    # Add recommendations
+    content.append(Paragraph("Recommendations", heading_style))
+    
+    # Add dosing recommendations
+    content.append(Paragraph("Dosing:", section_style))
+    for rec in dosing_recs:
+        content.append(Paragraph(f"• {rec}", normal_style))
+    content.append(Spacer(1, 8))
+    
+    # Add monitoring recommendations
+    content.append(Paragraph("Monitoring:", section_style))
+    for rec in monitoring_recs:
+        content.append(Paragraph(f"• {rec}", normal_style))
+    content.append(Spacer(1, 8))
+    
+    # Add cautions if any
+    if cautions and len(cautions) > 0:
+        content.append(Paragraph("Cautions:", section_style))
+        for caution in cautions:
+            content.append(Paragraph(f"• {caution}", normal_style))
+    
+    # Add disclaimer
+    content.append(Spacer(1, 20))
+    disclaimer_style = ParagraphStyle(
+        'Disclaimer',
+        parent=normal_style,
+        fontSize=8,
+        textColor=colors.grey
+    )
+    content.append(Paragraph("Disclaimer: This report is generated by an automated system and is intended to assist clinical decision making. Always use professional judgment when implementing recommendations.", disclaimer_style))
+    
+    # Build the PDF
+    doc.build(content)
+    
+    # Get the PDF value from the buffer
+    pdf_value = buffer.getvalue()
+    buffer.close()
+    
+    # Encode the PDF to base64
+    pdf_base64 = base64.b64encode(pdf_value).decode()
+    
+    return pdf_base64
 
-    except ZeroDivisionError:
-        st.error("Serum Creatinine cannot be zero for CrCl calculation.")
-        crcl = 0.0
-        renal_function = "Calculation Error"
+# Function to create a download link for the PDF
+def get_pdf_download_link(pdf_base64, filename="clinical_recommendations.pdf"):
+    """Create a download link for a base64 encoded PDF"""
+    href = f'<a href="data:application/pdf;base64,{pdf_base64}" download="{filename}">Download Clinical Recommendations PDF</a>'
+    return href
 
-    # Display calculated CrCl and renal function
-    st.metric("Estimated CrCl", f"{crcl:.1f} mL/min", help=renal_function)
-
-    # Current medication regimen
-    current_dose_regimen = st.text_input("Current Dosing Regimen (e.g., Vancomycin 1000mg q12h)", "Vancomycin 1000mg q12h")
-
-    st.info(f"Patient '{patient_id}' in '{ward}' with {renal_function.lower()} (CrCl: {crcl:.1f} mL/min)")
-
-    # Return patient data as a dictionary
-    return {
-        'patient_id': patient_id,
-        'ward': ward,
-        'age': age,
-        'gender': gender,
-        'weight': weight,
-        'height': height,
-        'serum_cr': serum_cr,
-        'crcl': crcl,
-        'renal_function': renal_function,
-        'clinical_diagnosis': clinical_diagnosis,
-        'current_dose_regimen': current_dose_regimen
-    }
+# Display a button to download the clinical recommendations as a PDF
+def display_pdf_download_button(patient_data, drug_info, levels_data, assessment, dosing_recs, monitoring_recs, cautions=None):
+    """
+    Display a button to download the clinical recommendations as a PDF
+    """
+    if st.button("📄 Print/Save Recommendations"):
+        # Generate the PDF
+        pdf_base64 = create_recommendation_pdf(
+            patient_data, 
+            drug_info, 
+            levels_data, 
+            assessment, 
+            dosing_recs, 
+            monitoring_recs, 
+            cautions
+        )
+        
+        # Create the download link
+        download_link = get_pdf_download_link(pdf_base64)
+        
+        # Display the download link
+        st.markdown(download_link, unsafe_allow_html=True)
+        
+        # Preview message
+        st.success("PDF generated successfully. Click the link above to download.")
 
 # ===== CONCENTRATION-TIME CURVE VISUALIZATION =====
-def plot_concentration_time_curve(drug_info, levels_data, assessment, dosing_recs, monitoring_recs, calculation_details, peak, trough, ke, tau, t_peak=1.0, infusion_time=1.0):
+def plot_concentration_time_curve(peak, trough, ke, tau, t_peak=1.0, infusion_time=1.0):
     """
-    Generate a concentration-time curve visualization.
-    Handles potential calculation errors gracefully.
+    Generate a concentration-time curve visualization
+    
+    Parameters:
+    - peak: Peak concentration (mg/L)
+    - trough: Trough concentration (mg/L)
+    - ke: Elimination rate constant (hr^-1)
+    - tau: Dosing interval (hr)
+    - t_peak: Time to peak after start of infusion (hr)
+    - infusion_time: Duration of infusion (hr)
+    
+    Returns:
+    - Altair chart object
     """
-    if ke <= 0 or tau <= 0 or peak <= 0 or trough < 0 or peak <= trough:
-        st.error(f"Invalid PK parameters for plotting (Ke={ke}, Tau={tau}, Peak={peak}, Trough={trough}). Cannot generate plot.")
-        return None # Return None if parameters are invalid
-
-    half_life = float('inf')
-    try:
-        half_life = 0.693 / ke
-    except ZeroDivisionError:
-        st.warning("Ke is zero, cannot calculate half-life for plot.")
-        return None # Cannot plot if Ke is zero
-
     # Generate time points for the curve
-    times = np.linspace(0, tau * 1.5, 100)  # Generate points for 1.5 intervals
-
+    times = np.linspace(0, tau*1.5, 100)  # Generate points for 1.5 intervals to show next dose
+    
     # Generate concentrations for each time point
     concentrations = []
-    try:
-        for t in times:
-            # During first infusion
-            if t <= infusion_time:
-                # Linear increase during infusion (avoid division by zero if infusion_time is 0)
-                conc = trough + (peak - trough) * (t / max(infusion_time, 1e-6))
-            # After infusion, before next dose
-            elif t <= tau:
-                # Exponential decay after peak
-                t_after_peak = t - t_peak
-                conc = peak * np.exp(-ke * t_after_peak)
-            # During second infusion
-            elif t <= tau + infusion_time:
-                # Second dose starts with trough and increases linearly
-                t_in_second_infusion = t - tau
-                conc = trough + (peak - trough) * (t_in_second_infusion / max(infusion_time, 1e-6))
-            # After second infusion
-            else:
-                # Exponential decay after second peak
-                t_after_second_peak = t - (tau + t_peak)
-                conc = peak * np.exp(-ke * t_after_second_peak)
-
-            concentrations.append(max(conc, 0)) # Ensure concentration is not negative
-
-    except Exception as e:
-        st.error(f"Error calculating concentrations for plot: {e}")
-        return None
-
+    
+    # Create time points and corresponding concentrations
+    for t in times:
+        # During first infusion
+        if t <= infusion_time:
+            # Linear increase during infusion
+            conc = peak * (t / infusion_time)
+        # After infusion, before next dose
+        elif t <= tau:
+            # Exponential decay after peak
+            t_after_peak = t - t_peak
+            conc = peak * np.exp(-ke * t_after_peak)
+        # During second infusion
+        elif t <= tau + infusion_time:
+            # Second dose starts with trough and increases linearly during infusion
+            t_in_second_infusion = t - tau
+            conc = trough + (peak - trough) * (t_in_second_infusion / infusion_time)
+        # After second infusion
+        else:
+            # Exponential decay after second peak
+            t_after_second_peak = t - (tau + t_peak)
+            conc = peak * np.exp(-ke * t_after_second_peak)
+            
+        concentrations.append(conc)
+    
     # Create DataFrame for plotting
     df = pd.DataFrame({
         'Time (hr)': times,
         'Concentration (mg/L)': concentrations
     })
-
-    # --- Target Range Bands (Simplified - Add specific logic if needed) ---
-    target_peak_y1, target_peak_y2 = peak * 0.8, peak * 1.2
-    target_trough_y1, target_trough_y2 = trough * 0.5, trough * 1.5
-
-    # Adjust based on drug type (Example for Vancomycin)
-    if "Vancomycin" in drug_info:
-        target_peak_y1, target_peak_y2 = 20, 40
-        target_trough_y1, target_trough_y2 = 10, 15 # Example, adjust based on empirical/definitive
-        if "Definitive" in drug_info:
-             target_trough_y1, target_trough_y2 = 15, 20
-    elif "Gentamicin" in drug_info:
-        if "SDD" in drug_info:
-            target_peak_y1, target_peak_y2 = 10, 30
-            target_trough_y1, target_trough_y2 = 0, 1
-        elif "Synergy" in drug_info:
-            target_peak_y1, target_peak_y2 = 3, 5
-            target_trough_y1, target_trough_y2 = 0, 1
-        else: # MDD
-            target_peak_y1, target_peak_y2 = 5, 10
-            target_trough_y1, target_trough_y2 = 0, 2
-    elif "Amikacin" in drug_info:
-        if "SDD" in drug_info:
-            target_peak_y1, target_peak_y2 = 60, 80
-            target_trough_y1, target_trough_y2 = 0, 1
-        else: # MDD
-            target_peak_y1, target_peak_y2 = 20, 30
-            target_trough_y1, target_trough_y2 = 0, 10
-
-
-    target_peak_band = alt.Chart(pd.DataFrame({
-        'y1': [target_peak_y1], 'y2': [target_peak_y2]
-    })).mark_rect(opacity=0.2, color='lightgreen').encode(
-        y='y1', y2='y2'
-    )
-
-    target_trough_band = alt.Chart(pd.DataFrame({
-        'y1': [target_trough_y1], 'y2': [target_trough_y2]
-    })).mark_rect(opacity=0.2, color='lightblue').encode(
-        y='y1', y2='y2'
-    )
-
-    # Create the concentration-time curve line
+    
+    # Create horizontal bands for target ranges
+    if peak > 50:  # Likely vancomycin
+        target_peak_band = alt.Chart(pd.DataFrame({
+            'y1': [20], 'y2': [40]  # Typical peak range for vancomycin
+        })).mark_rect(opacity=0.2, color='green').encode(
+            y='y1', y2='y2'
+        )
+        target_trough_band = alt.Chart(pd.DataFrame({
+            'y1': [10], 'y2': [15]  # Typical trough range for vancomycin
+        })).mark_rect(opacity=0.2, color='blue').encode(
+            y='y1', y2='y2'
+        )
+    else:  # Likely aminoglycoside
+        target_peak_band = alt.Chart(pd.DataFrame({
+            'y1': [6], 'y2': [12]  # Typical peak range for gentamicin
+        })).mark_rect(opacity=0.2, color='green').encode(
+            y='y1', y2='y2'
+        )
+        target_trough_band = alt.Chart(pd.DataFrame({
+            'y1': [0], 'y2': [2]  # Typical trough range for gentamicin
+        })).mark_rect(opacity=0.2, color='blue').encode(
+            y='y1', y2='y2'
+        )
+    
+    # Create the concentration-time curve
     line = alt.Chart(df).mark_line().encode(
         x=alt.X('Time (hr)', title='Time (hours)'),
-        y=alt.Y('Concentration (mg/L)', title='Drug Concentration (mg/L)', scale=alt.Scale(zero=False)) # Ensure Y axis doesn't always start at 0
+        y=alt.Y('Concentration (mg/L)', title='Drug Concentration (mg/L)')
     )
-
-    # Add markers for actual measured peak and trough
-    markers = alt.Chart(pd.DataFrame({
-        'Time (hr)': [t_peak, tau],
-        'Concentration (mg/L)': [peak, trough],
-        'Label': ['Peak', 'Trough']
-    })).mark_point(size=100, filled=True).encode(
-        x='Time (hr)',
-        y='Concentration (mg/L)',
-        color=alt.Color('Label', scale=alt.Scale(domain=['Peak', 'Trough'], range=['green', 'blue'])),
-        tooltip=['Label', 'Time (hr)', 'Concentration (mg/L)']
-    )
-
+    
     # Add vertical lines for key time points
-    infusion_end_line = alt.Chart(pd.DataFrame({'x': [infusion_time]})).mark_rule(
+    infusion_end = alt.Chart(pd.DataFrame({'x': [infusion_time]})).mark_rule(
         strokeDash=[5, 5], color='gray'
     ).encode(x='x')
-
-    next_dose_line = alt.Chart(pd.DataFrame({'x': [tau]})).mark_rule(
+    
+    next_dose = alt.Chart(pd.DataFrame({'x': [tau]})).mark_rule(
         strokeDash=[5, 5], color='red'
     ).encode(x='x')
-
-    # Add text annotations for key time points
-    annotations = alt.Chart(pd.DataFrame({
-        'x': [infusion_time / 2, tau],
-        'y': [peak * 1.1, trough * 0.9], # Adjust y position relative to peak/trough
-        'text': ['Infusion', 'Next Dose']
-    })).mark_text(align='center', dy=-10).encode( # Adjust dy for vertical position
-        x='x',
-        y='y',
-        text='text'
-    )
-
-    # Display half-life text
-    half_life_text = alt.Chart(pd.DataFrame({
-        'x': [tau / 2],
-        'y': [peak * 0.5], # Position roughly in the middle
-        'text': [f"t½ = {half_life:.1f} hr"]
-    })).mark_text(align='center').encode(
-        x='x',
-        y='y',
-        text='text'
-    )
-
+    
     # Combine charts
     chart = alt.layer(
-        target_peak_band,
-        target_trough_band,
-        line,
-        markers,
-        infusion_end_line,
-        next_dose_line,
-        annotations,
-        half_life_text
+        target_peak_band, 
+        target_trough_band, 
+        line, 
+        infusion_end,
+        next_dose
     ).properties(
         width=600,
         height=400,
-        title=f'{drug_info} Concentration-Time Profile'
-    ).interactive() # Make chart interactive (zoom/pan)
-
-    # Display detailed calculation steps in an expander (ensure calculation_details is a string)
-    if calculation_details and isinstance(calculation_details, str):
-        with st.expander("View Calculation Details", expanded=False):
-            st.markdown("### PK Parameter Calculations")
-            st.markdown(f"""
-            **Input Levels:**
-            - Peak concentration (Cmax): {peak:.2f} mg/L (at {t_peak} hr)
-            - Trough concentration (Cmin): {trough:.2f} mg/L (at {tau} hr)
-
-            **Calculated Parameters:**
-            - Elimination rate constant (Ke): {ke:.4f} hr⁻¹
-            - Half-life (t½): {half_life:.2f} hr
-            - Dosing interval (τ): {tau} hr
-
-            **Calculation Formulas Used:**
-            ```
-            Ke = -ln(Cmin/Cmax) / (τ - t_peak)
-            t½ = 0.693 / Ke
-            ```
-
-            **Assessment:**
-            {assessment}
-
-            **Dosing Recommendations:**
-            """ + "\n".join([f"- {rec}" for rec in dosing_recs]) + """
-
-            **Monitoring Recommendations:**
-            """ + "\n".join([f"- {rec}" for rec in monitoring_recs]))
-
-            st.markdown("**Additional Calculation Information:**")
-            st.markdown(calculation_details) # Display the passed calculation details string
-
+        title='Concentration-Time Profile'
+    )
+    
     return chart
-
-# ===== PDF GENERATION FUNCTIONS =====
-def create_recommendation_pdf(patient_data, drug_info, levels_data, assessment, dosing_recs, monitoring_recs, calculation_details=None, cautions=None):
+    
+# ===== BAYESIAN PARAMETER ESTIMATION =====
+def bayesian_parameter_estimation(measured_levels, sample_times, dose, tau, weight, age, crcl, gender):
     """
-    Create a downloadable PDF with the clinical recommendations.
-    Requires reportlab to be installed.
+    Bayesian estimation of PK parameters based on measured levels
+    
+    Parameters:
+    - measured_levels: List of measured drug concentrations (mg/L)
+    - sample_times: List of times when samples were taken (hr after dose)
+    - dose: Dose administered (mg)
+    - tau: Dosing interval (hr)
+    - weight: Patient weight (kg)
+    - age: Patient age (years)
+    - crcl: Creatinine clearance (mL/min)
+    - gender: Patient gender ("Male" or "Female")
+    
+    Returns:
+    - Dictionary with estimated PK parameters
     """
-    if not REPORTLAB_AVAILABLE:
-        st.error("ReportLab library is not available. Cannot generate PDF.")
+    if not BAYESIAN_AVAILABLE:
+        st.error("Bayesian estimation requires scipy. Please install it with 'pip install scipy'")
         return None
-
-    try:
-        buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=72, leftMargin=72, topMargin=72, bottomMargin=72)
-
-        # Styles
-        styles = getSampleStyleSheet()
-        title_style = styles['h1'] # Use h1 for main title
-        heading_style = styles['h2']
-        normal_style = styles['Normal']
-        section_style = ParagraphStyle(
-            'SectionStyle',
-            parent=styles['h3'], # Use h3 for section titles
-            spaceAfter=6,
-            textColor=colors.navy
-        )
-        disclaimer_style = ParagraphStyle(
-            'Disclaimer',
-            parent=normal_style,
-            fontSize=8,
-            textColor=colors.grey
-        )
-        bold_normal_style = ParagraphStyle('BoldNormal', parent=normal_style, fontName='Helvetica-Bold')
-
-        content = []
-
-        # Title and Date
-        content.append(Paragraph("Antimicrobial TDM Report", title_style))
-        content.append(Spacer(1, 12))
-        now = datetime.now()
-        content.append(Paragraph(f"Report Generated: {now.strftime('%Y-%m-%d %H:%M')}", normal_style))
-        content.append(Spacer(1, 12))
-
-        # Patient Information
-        content.append(Paragraph("Patient Information", heading_style))
-        patient_info_data = [
-            [Paragraph("<b>Patient ID:</b>", normal_style), Paragraph(f"{patient_data.get('patient_id', 'N/A')}", normal_style),
-             Paragraph("<b>Ward:</b>", normal_style), Paragraph(f"{patient_data.get('ward', 'N/A')}", normal_style)],
-            [Paragraph("<b>Age:</b>", normal_style), Paragraph(f"{patient_data.get('age', 'N/A')} years", normal_style),
-             Paragraph("<b>Gender:</b>", normal_style), Paragraph(f"{patient_data.get('gender', 'N/A')}", normal_style)],
-            [Paragraph("<b>Weight:</b>", normal_style), Paragraph(f"{patient_data.get('weight', 'N/A')} kg", normal_style),
-             Paragraph("<b>Height:</b>", normal_style), Paragraph(f"{patient_data.get('height', 'N/A')} cm", normal_style)],
-            [Paragraph("<b>Serum Cr:</b>", normal_style), Paragraph(f"{patient_data.get('serum_cr', 'N/A')} µmol/L", normal_style),
-             Paragraph("<b>CrCl:</b>", normal_style), Paragraph(f"{patient_data.get('crcl', 0.0):.1f} mL/min", normal_style)],
-            [Paragraph("<b>Diagnosis:</b>", normal_style), Paragraph(f"{patient_data.get('clinical_diagnosis', 'N/A')}", normal_style),
-             Paragraph("<b>Renal Fn:</b>", normal_style), Paragraph(f"{patient_data.get('renal_function', 'N/A')}", normal_style)],
-             # Span Current Regimen across columns
-            [Paragraph("<b>Current Regimen:</b>", normal_style), Paragraph(f"{patient_data.get('current_dose_regimen', 'N/A')}", normal_style), '', '']
-        ]
-        patient_table = Table(patient_info_data, colWidths=[80, 170, 80, 170]) # Adjusted widths
-        patient_table.setStyle(TableStyle([
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            # Span the last row's second cell
-            ('SPAN', (1, 5), (3, 5)),
-            # Bold labels
-            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-            ('FONTNAME', (2, 0), (2, 4), 'Helvetica-Bold'), # Bold labels in 3rd column up to Renal Fn
-        ]))
-        content.append(patient_table)
-        content.append(Spacer(1, 12))
-
-        # Drug Information
-        content.append(Paragraph("Drug Information", heading_style))
-        content.append(Paragraph(drug_info, normal_style))
-        content.append(Spacer(1, 12))
-
-        # Clinical Assessment
-        content.append(Paragraph("Clinical Assessment", heading_style))
-        content.append(Paragraph("Measured Levels:", section_style))
-
-        # Levels Table
-        levels_table_data = [[Paragraph("<b>Parameter</b>", normal_style), Paragraph("<b>Value</b>", normal_style),
-                              Paragraph("<b>Target Range</b>", normal_style), Paragraph("<b>Status</b>", normal_style)]]
-        for name, value, target, status in levels_data:
-            status_text = "Within Range"
-            status_color = colors.lightgreen
-            if status == "below":
-                status_text = "Below Range"
-                status_color = colors.lightyellow
-            elif status == "above":
-                status_text = "Above Range"
-                status_color = colors.mistyrose
-
-            levels_table_data.append([
-                Paragraph(name, normal_style),
-                Paragraph(value, normal_style),
-                Paragraph(target, normal_style),
-                Paragraph(status_text, ParagraphStyle('StatusStyle', parent=normal_style, backColor=status_color)) # Apply background color directly
-            ])
-
-        levels_table = Table(levels_table_data, colWidths=[100, 100, 150, 150]) # Adjusted widths
-        levels_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey), # Header background
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'), # Bold header
-        ]))
-        # This loop for coloring is now handled by ParagraphStyle background
-        # for i, (_, _, _, status) in enumerate(levels_data, 1):
-        #     # ... (color logic removed as it's in ParagraphStyle)
-        content.append(levels_table)
-        content.append(Spacer(1, 8))
-
-        # Assessment Text
-        content.append(Paragraph("Assessment:", section_style))
-        content.append(Paragraph(f"Patient is {assessment.upper()}", bold_normal_style)) # Make assessment bold
-        content.append(Spacer(1, 12))
-
-        # Calculation Details
-        if calculation_details:
-            content.append(Paragraph("Calculation Details:", section_style))
-            # Use preformatted style for code-like text
-            pre_style = styles['Code']
-            calc_paragraph = Paragraph(calculation_details.replace('\n', '<br/>'), pre_style)
-            content.append(calc_paragraph)
-            content.append(Spacer(1, 12))
-
-        # Recommendations
-        content.append(Paragraph("Recommendations", heading_style))
-        content.append(Paragraph("Dosing:", section_style))
-        for rec in dosing_recs:
-            content.append(Paragraph(f"• {rec}", normal_style))
-        content.append(Spacer(1, 8))
-
-        content.append(Paragraph("Monitoring:", section_style))
-        for rec in monitoring_recs:
-            content.append(Paragraph(f"• {rec}", normal_style))
-        content.append(Spacer(1, 8))
-
-        # Cautions
-        if cautions and len(cautions) > 0:
-            content.append(Paragraph("Cautions:", section_style))
-            for caution in cautions:
-                content.append(Paragraph(f"• {caution}", normal_style))
-            content.append(Spacer(1, 8))
-
-        # Disclaimer
-        content.append(Spacer(1, 20))
-        content.append(Paragraph("Disclaimer: This report is generated by an automated system and is intended to assist clinical decision making. Always use professional judgment when implementing recommendations.", disclaimer_style))
-
-        # Build the PDF
-        doc.build(content)
-
-        pdf_value = buffer.getvalue()
-        buffer.close()
-        pdf_base64 = base64.b64encode(pdf_value).decode()
-        return pdf_base64
-
-    except Exception as e:
-        st.error(f"Error generating PDF: {e}")
-        return None
-
-# Function to create a download link for the PDF
-def get_pdf_download_link(pdf_base64, filename="clinical_recommendations.pdf"):
-    """Create a download link for a base64 encoded PDF"""
-    if pdf_base64:
-        href = f'<a href="data:application/pdf;base64,{pdf_base64}" download="{filename}" style="background-color: #4CAF50; color: white; padding: 10px 20px; text-align: center; text-decoration: none; display: inline-block; border-radius: 5px;">📄 Download Full Report PDF</a>'
-        return href
-    return ""
-
-# Updated function to display buttons for printing and downloading recommendations
-def display_pdf_download_button(patient_data, drug_info, levels_data, assessment, dosing_recs, monitoring_recs, calculation_details=None, cautions=None):
-    """
-    Display buttons to print/save recommendations as a PDF and print a summary.
-    Requires ReportLab for PDF generation.
-    """
-    st.markdown("---") # Add a separator
-    st.subheader("Export Options")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        # Generate PDF content when the section loads, not just on button click
-        pdf_base64 = None
-        if REPORTLAB_AVAILABLE:
-             pdf_base64 = create_recommendation_pdf(
-                 patient_data, drug_info, levels_data, assessment,
-                 dosing_recs, monitoring_recs, calculation_details, cautions
-             )
-
-        if pdf_base64:
-             download_link = get_pdf_download_link(pdf_base64)
-             st.markdown(download_link, unsafe_allow_html=True)
-        else:
-             st.button("📄 Generate Full Report PDF", disabled=True, help="PDF generation requires ReportLab or failed.")
-
-
-    with col2:
-        if st.button("📋 Generate Clinical Summary"):
-            assessment_text = create_printable_assessment(patient_data, levels_data, assessment, dosing_recs, monitoring_recs, calculation_details, cautions) # Pass calc details here too
-            st.text_area("Copy this text for clinical notes:", assessment_text, height=300)
-            st.success("Clinical summary text generated below.")
-
-# Enhanced function to create a printable text assessment
-def create_printable_assessment(patient_data, levels_data, assessment, dosing_recs, monitoring_recs, calculation_details=None, cautions=None):
-    """Create a plain text printable assessment for easy copying to clinical notes"""
-    now = datetime.now()
-
-    # Header
-    text = f"ANTIMICROBIAL TDM ASSESSMENT - {now.strftime('%Y-%m-%d %H:%M')}\n"
-    text += "=" * 60 + "\n\n"
-
-    # Patient Information
-    text += f"Patient ID: {patient_data.get('patient_id', 'N/A')}\n"
-    text += f"Ward: {patient_data.get('ward', 'N/A')}\n"
-    text += f"Age: {patient_data.get('age', 'N/A')} yrs | Gender: {patient_data.get('gender', 'N/A')} | Weight: {patient_data.get('weight', 'N/A')} kg\n"
-    text += f"Diagnosis: {patient_data.get('clinical_diagnosis', 'N/A')}\n"
-    text += f"CrCl: {patient_data.get('crcl', 0.0):.1f} mL/min ({patient_data.get('renal_function', 'N/A')})\n"
-    text += f"Current Regimen: {patient_data.get('current_dose_regimen', 'N/A')}\n\n"
-
-    # Measured Levels
-    text += "MEASURED LEVELS:\n"
-    if levels_data:
-        for name, value, target, status in levels_data:
-            status_symbol = "✅" if status == "within" else "⬇️" if status == "below" else "⬆️"
-            text += f"- {name}: {value} (Target: {target}) {status_symbol}\n"
-    else:
-        text += "- No levels data available.\n"
-    text += "\n"
-
-    # Assessment
-    text += f"ASSESSMENT: Patient is {assessment.upper()}\n\n"
-
-    # PK Parameters (Extract from calculation_details if provided)
-    if calculation_details and isinstance(calculation_details, str):
-        text += "PHARMACOKINETIC PARAMETERS (Estimated/Calculated):\n"
-        # Use regex to find key parameters in the details string
-        ke_match = re.search(r'Ke\s*[:=]\s*([0-9.]+)', calculation_details, re.IGNORECASE)
-        thalf_match = re.search(r't½\s*[:=]\s*([0-9.]+)', calculation_details, re.IGNORECASE)
-        vd_match = re.search(r'Vd\s*[:=]\s*([0-9.]+)\s*L', calculation_details, re.IGNORECASE)
-        cl_match = re.search(r'Cl\s*[:=]\s*([0-9.]+)\s*L/hr', calculation_details, re.IGNORECASE)
-        auc_match = re.search(r'AUC24\s*[:=]\s*([0-9.]+)', calculation_details, re.IGNORECASE)
-
-        if ke_match: text += f"- Ke: {float(ke_match.group(1)):.4f} hr⁻¹\n"
-        if thalf_match: text += f"- t½: {float(thalf_match.group(1)):.1f} hr\n"
-        if vd_match: text += f"- Vd: {float(vd_match.group(1)):.1f} L\n"
-        if cl_match: text += f"- Cl: {float(cl_match.group(1)):.2f} L/hr\n"
-        if auc_match: text += f"- AUC24: {float(auc_match.group(1)):.1f} mg·hr/L\n"
-        text += "\n"
-
-    # Recommendations
-    text += "DOSING RECOMMENDATIONS:\n"
-    if dosing_recs:
-        for rec in dosing_recs:
-            text += f"- {rec}\n"
-    else:
-        text += "- No specific dosing recommendations generated.\n"
-    text += "\n"
-
-    text += "MONITORING RECOMMENDATIONS:\n"
-    if monitoring_recs:
-        for rec in monitoring_recs:
-            text += f"- {rec}\n"
-    else:
-        text += "- No specific monitoring recommendations generated.\n"
-    text += "\n"
-
-    # Cautions
-    if cautions and len(cautions) > 0:
-        text += "CAUTIONS & CONSIDERATIONS:\n"
-        for caution in cautions:
-            text += f"- {caution}\n"
-        text += "\n"
-
-    # Footer
-    text += "=" * 60 + "\n"
-    text += "Disclaimer: This assessment is intended to assist clinical decision making.\n"
-    text += "Always use professional judgment when implementing recommendations.\n"
-    text += f"Generated by: Antimicrobial TDM App - {now.strftime('%Y-%m-%d %H:%M')}"
-
-    return text
-
-# ===== VANCOMYCIN INTERPRETATION FUNCTION =====
-def generate_vancomycin_interpretation(prompt):
-    """
-    Generate standardized vancomycin interpretation based on a prompt string.
-    Extracts values using regex for better robustness.
-    Returns a tuple: (levels_data, assessment, dosing_recs, monitoring_recs, cautions)
-    or returns an error string.
-    """
-    peak_val, trough_val, auc24 = None, None, None
-    peak_target_min, peak_target_max = 20, 40 # Default peak target
-    trough_target_min, trough_target_max = 10, 20 # Default trough target
-    auc_target_min, auc_target_max = 400, 600 # Default AUC target
-    new_dose_rec = None
-
-    # Regex patterns to extract values
-    patterns = {
-        'peak': r'peak\s*[:=]\s*([0-9.]+)',
-        'trough': r'trough\s*[:=]\s*([0-9.]+)',
-        'auc': r'AUC24\s*[:=]\s*([0-9.]+)',
-        'trough_target': r'Target trough range\s*[:=]\s*([0-9]+)\s*-\s*([0-9]+)',
-        'peak_target': r'Target peak range\s*[:=]\s*([0-9]+)\s*-\s*([0-9]+)',
-        'auc_target': r'Target AUC range\s*[:=]\s*([0-9]+)\s*-\s*([0-9]+)',
-        'new_dose': r'(?:Recommended|Suggested) base dose\s*[:=]\s*([0-9.]+)'
+        
+    # Prior population parameters for vancomycin
+    # Mean values
+    vd_pop_mean = 0.7  # L/kg
+    ke_pop_mean = 0.0044 + 0.00083 * crcl  # hr^-1
+    
+    # Standard deviations for population parameters
+    vd_pop_sd = 0.2  # L/kg 
+    ke_pop_sd = 0.002  # hr^-1
+    
+    # Define objective function to minimize (negative log likelihood)
+    def objective_function(params):
+        vd, ke = params
+        vd_total = vd * weight
+        
+        # Calculate expected concentrations at sample times
+        expected_concs = []
+        for t in sample_times:
+            # Calculate which dosing interval this sample is in
+            interval = int(t / tau)
+            t_in_interval = t % tau
+            
+            # Calculate concentration at this time
+            conc = 0
+            for i in range(interval + 1):
+                # Add contribution from each previous dose
+                t_after_dose = t - i * tau
+                if t_after_dose > 0:
+                    # Assuming 1-hour infusion with immediate distribution
+                    if t_after_dose <= 1:
+                        # During infusion: linear increase
+                        peak_conc = dose / vd_total
+                        conc += peak_conc * (t_after_dose / 1)
+                    else:
+                        # After infusion: exponential decay
+                        peak_conc = dose / vd_total
+                        conc += peak_conc * np.exp(-ke * (t_after_dose - 1))
+            
+            expected_concs.append(conc)
+        
+        # Calculate negative log likelihood
+        # Assuming measurement error is normally distributed
+        measurement_error_sd = 2.0  # mg/L
+        nll = 0
+        for i in range(len(measured_levels)):
+            # Add contribution from measurement likelihood
+            nll += -norm.logpdf(measured_levels[i], expected_concs[i], measurement_error_sd)
+        
+        # Add contribution from parameter priors
+        nll += -norm.logpdf(vd, vd_pop_mean, vd_pop_sd)
+        nll += -norm.logpdf(ke, ke_pop_mean, ke_pop_sd)
+        
+        return nll
+    
+    # Initial guess based on population values
+    initial_params = [vd_pop_mean, ke_pop_mean]
+    
+    # Parameter bounds
+    bounds = [(0.1, 2.0), (0.001, 0.3)]  # Reasonable bounds for Vd and Ke
+    
+    # Perform optimization
+    result = optimize.minimize(
+        objective_function, 
+        initial_params,
+        bounds=bounds,
+        method='L-BFGS-B'
+    )
+    
+    # Extract optimized parameters
+    vd_opt, ke_opt = result.x
+    vd_total_opt = vd_opt * weight
+    cl_opt = ke_opt * vd_total_opt
+    t_half_opt = 0.693 / ke_opt
+    
+    return {
+        'vd': vd_opt,
+        'vd_total': vd_total_opt,
+        'ke': ke_opt,
+        'cl': cl_opt,
+        't_half': t_half_opt,
+        'optimization_success': result.success
     }
 
-    # Extract values using regex
-    for key, pattern in patterns.items():
-        match = re.search(pattern, prompt, re.IGNORECASE)
-        if match:
-            try:
-                if key == 'peak': peak_val = float(match.group(1))
-                elif key == 'trough': trough_val = float(match.group(1))
-                elif key == 'auc': auc24 = float(match.group(1))
-                elif key == 'trough_target':
-                    trough_target_min = float(match.group(1))
-                    trough_target_max = float(match.group(2))
-                elif key == 'peak_target':
-                    peak_target_min = float(match.group(1))
-                    peak_target_max = float(match.group(2))
-                elif key == 'auc_target':
-                    auc_target_min = float(match.group(1))
-                    auc_target_max = float(match.group(2))
-                elif key == 'new_dose': new_dose_rec = float(match.group(1))
-            except (ValueError, IndexError):
-                 print(f"Warning: Could not parse value for {key} from prompt.") # Log parsing issues
-
-    # Format targets
-    peak_target_str = f"{peak_target_min}-{peak_target_max} mg/L"
-    trough_target_str = f"{trough_target_min}-{trough_target_max} mg/L"
-    auc_target_str = f"{auc_target_min}-{auc_target_max} mg·hr/L"
-
-    # Determine assessment status based on available data
-    assessment = "requires clinical correlation" # Default assessment
-    levels_data = []
-    monitoring_focus = "trough" # Default focus
-
-    if auc24 is not None:
-        monitoring_focus = "AUC"
-        auc_status = "within" if auc_target_min <= auc24 <= auc_target_max else ("below" if auc24 < auc_target_min else "above")
-        levels_data.append(("AUC24", f"{auc24:.1f} mg·hr/L", auc_target_str, auc_status))
-        if auc_status == "below": assessment = "subtherapeutic (low AUC)"
-        elif auc_status == "above": assessment = "potentially supratherapeutic (high AUC)"
-        else: assessment = "appropriately dosed (AUC-based)"
-        # Add estimated trough if available
-        if trough_val is not None:
-             trough_status = "within" if trough_target_min <= trough_val <= trough_target_max else ("below" if trough_val < trough_target_min else "above")
-             levels_data.append(("Estimated Trough", f"{trough_val:.1f} mg/L", trough_target_str, trough_status))
-
-    elif peak_val is not None and trough_val is not None:
-        monitoring_focus = "peak & trough"
-        peak_status = "within" if peak_target_min <= peak_val <= peak_target_max else ("below" if peak_val < peak_target_min else "above")
-        trough_status = "within" if trough_target_min <= trough_val <= trough_target_max else ("below" if trough_val < trough_target_min else "above")
-        levels_data.append(("Peak", f"{peak_val:.1f} mg/L", peak_target_str, peak_status))
-        levels_data.append(("Trough", f"{trough_val:.1f} mg/L", trough_target_str, trough_status))
-
-        if peak_status == "below" and trough_status == "below": assessment = "subtherapeutic (low peak & trough)"
-        elif peak_status == "below": assessment = "potential underdosing (low peak)"
-        elif trough_status == "below": assessment = "subtherapeutic (low trough)"
-        elif trough_status == "above": assessment = "potentially supratherapeutic (high trough)"
-        elif peak_status == "above": assessment = "potentially supratherapeutic (high peak)"
-        elif peak_status == "within" and trough_status == "within": assessment = "appropriately dosed"
-        else: assessment = "requires adjustment" # Covers mixed scenarios
-
-    elif trough_val is not None:
-        monitoring_focus = "trough"
-        trough_status = "within" if trough_target_min <= trough_val <= trough_target_max else ("below" if trough_val < trough_target_min else "above")
-        levels_data.append(("Trough", f"{trough_val:.1f} mg/L", trough_target_str, trough_status))
-        if trough_status == "below": assessment = "subtherapeutic (low trough)"
-        elif trough_status == "above": assessment = "potentially supratherapeutic (high trough)"
-        else: assessment = "appropriately dosed (trough-based)"
-
-    else:
-        return "Insufficient data in prompt to generate Vancomycin interpretation. Need at least Trough, Peak/Trough, or AUC."
-
-    # Generate recommendations
-    dosing_recs = []
-    monitoring_recs = []
-    cautions = []
-
-    # Round recommended dose if available
-    rounded_new_dose_str = ""
-    if new_dose_rec:
-        rounded_dose = round(new_dose_rec / 250) * 250
-        rounded_new_dose_str = f"{int(rounded_dose)}mg" # Format as integer string
-
-    # Tailor recommendations based on assessment
-    if "subtherapeutic" in assessment or "underdosing" in assessment:
-        action = f"INCREASE dose to {rounded_new_dose_str}" if rounded_new_dose_str else "INCREASE dose (e.g., by 25-30%)"
-        dosing_recs.append(action)
-        dosing_recs.append("CONSIDER shortening dosing interval if appropriate")
-        monitoring_recs.append(f"RECHECK levels ({monitoring_focus}) after 3-4 doses")
-        cautions.append("Subtherapeutic levels risk treatment failure.")
-    elif "supratherapeutic" in assessment:
-        action = f"DECREASE dose to {rounded_new_dose_str}" if rounded_new_dose_str else "DECREASE dose (e.g., by 20-25%)"
-        dosing_recs.append(action)
-        dosing_recs.append("CONSIDER extending dosing interval")
-        monitoring_recs.append(f"RECHECK levels ({monitoring_focus}) after 3-4 doses")
-        monitoring_recs.append("MONITOR renal function closely")
-        monitoring_recs.append("ASSESS for signs/symptoms of nephrotoxicity")
-        cautions.append("Elevated levels increase risk of nephrotoxicity.")
-    elif "appropriately dosed" in assessment:
-        dosing_recs.append("CONTINUE current dosing regimen")
-        monitoring_recs.append(f"ROUTINE monitoring: Recheck levels ({monitoring_focus}) if clinical status or renal function changes significantly.")
-        cautions.append("Monitor for adverse effects even with therapeutic levels.")
-    else: # requires adjustment / requires clinical correlation
-        action = f"ADJUST dose towards {rounded_new_dose_str}" if rounded_new_dose_str else "ADJUST dose based on clinical picture and levels"
-        dosing_recs.append(action)
-        monitoring_recs.append(f"RECHECK levels ({monitoring_focus}) after adjustment")
-        cautions.append("Individualize therapy based on clinical response and specific targets.")
-
-    # Standard monitoring
-    monitoring_recs.append("MONITOR renal function regularly (e.g., every 2-3 days or as clinically indicated)")
-
-    return levels_data, assessment, dosing_recs, monitoring_recs, cautions
-
-# ===== AMINOGLYCOSIDE INTERPRETATION FUNCTION =====
-def generate_aminoglycoside_interpretation(prompt):
+# ===== IMPROVED CLINICAL INTERPRETATION FUNCTION =====
+def interpret_with_llm(prompt, patient_data=None):
     """
-    Generate standardized aminoglycoside interpretation based on a prompt string.
-    Extracts values using regex for better robustness.
-    Returns a tuple: (levels_data, assessment, dosing_recs, monitoring_recs, cautions)
-    or returns an error string.
+    Enhanced clinical interpretation function for antimicrobial TDM with improved recommendation formatting
+    and PDF printing capability
+    
+    This function can call the OpenAI API if configured, otherwise
+    it will provide a simulated response with a standardized, clinically relevant format.
+    
+    Parameters:
+    - prompt: The clinical data prompt
+    - patient_data: Optional dictionary with patient information for PDF generation
     """
-    drug_name = "Aminoglycoside"
-    peak_val, trough_val = None, None
-    peak_target_min, peak_target_max = 5, 10 # Default MDD Gentamicin peak target
-    trough_target_max = 2.0 # Default MDD Gentamicin trough target
-    new_dose_rec, new_interval_rec = None, None
-    regimen = "MDD" # Default regimen
-
-    # Identify drug and regimen
-    if "Gentamicin" in prompt: drug_name = "Gentamicin"
-    elif "Amikacin" in prompt: drug_name = "Amikacin"
-
-    if "SDD" in prompt: regimen = "SDD"
-    elif "Synergy" in prompt: regimen = "Synergy"
-    elif "MDD" in prompt: regimen = "MDD"
-
-    # Set targets based on drug and regimen
-    if drug_name == "Gentamicin":
-        if regimen == "SDD": peak_target_min, peak_target_max, trough_target_max = 10, 30, 1.0
-        elif regimen == "Synergy": peak_target_min, peak_target_max, trough_target_max = 3, 5, 1.0
-        else: peak_target_min, peak_target_max, trough_target_max = 5, 10, 2.0 # MDD
-    elif drug_name == "Amikacin":
-        if regimen == "SDD": peak_target_min, peak_target_max, trough_target_max = 60, 80, 1.0
-        else: peak_target_min, peak_target_max, trough_target_max = 20, 30, 10.0 # MDD (Synergy less common)
-
-    # Regex patterns
-    patterns = {
-        'peak': r'(?:peak|Cmax)\s*[:=]\s*([0-9.]+)',
-        'trough': r'(?:trough|Cmin)\s*[:=]\s*([0-9.]+)',
-        'peak_target': r'Target peak range\s*[:=]\s*([0-9]+)\s*-\s*([0-9]+)',
-        'trough_target': r'Target trough\s*[:=]\s*<\s*([0-9.]+)',
-        'new_dose': r'(?:Recommended|Suggested) new dose\s*[:=]\s*([0-9.]+)',
-        'new_interval': r'(?:Recommended|Suggested) new interval\s*[:=]\s*([0-9]+)'
-    }
-
-    # Extract values
-    for key, pattern in patterns.items():
-        match = re.search(pattern, prompt, re.IGNORECASE)
-        if match:
-            try:
-                if key == 'peak': peak_val = float(match.group(1))
-                elif key == 'trough': trough_val = float(match.group(1))
-                elif key == 'peak_target':
-                    peak_target_min = float(match.group(1))
-                    peak_target_max = float(match.group(2))
-                elif key == 'trough_target': trough_target_max = float(match.group(1))
-                elif key == 'new_dose': new_dose_rec = float(match.group(1))
-                elif key == 'new_interval': new_interval_rec = int(match.group(1))
-            except (ValueError, IndexError):
-                print(f"Warning: Could not parse value for {key} from prompt.")
-
-    # Format targets
-    peak_target_str = f"{peak_target_min}-{peak_target_max} mg/L"
-    trough_target_str = f"<{trough_target_max} mg/L"
-
-    # Require both peak and trough for interpretation
-    if peak_val is None or trough_val is None:
-        # Allow interpretation for SDD without levels if needed (based on Hartford etc.)
-        if regimen == "SDD" and "Hartford" in prompt:
-             # Placeholder - Add logic to interpret based on Hartford nomogram text if needed
-             assessment = "requires assessment based on nomogram/timing"
-             levels_data = [("Level (Time Unknown)", "N/A", "N/A", "N/A")] # Indicate level was measured but not peak/trough
-        else:
-             return f"Insufficient data in prompt for {drug_name} interpretation. Need Peak and Trough levels for {regimen}."
-
-
-    # Determine assessment status
-    assessment = "requires clinical correlation" # Default
-    peak_status = "within" if peak_target_min <= peak_val <= peak_target_max else ("below" if peak_val < peak_target_min else "above")
-    trough_status = "within" if trough_val < trough_target_max else "above" # Only care if trough is above max
-
-    levels_data = [
-        ("Peak", f"{peak_val:.1f} mg/L", peak_target_str, peak_status),
-        ("Trough", f"{trough_val:.2f} mg/L", trough_target_str, trough_status)
-    ]
-
-    if peak_status == "below" and trough_status == "above": assessment = "ineffective and potentially toxic (low peak, high trough)"
-    elif peak_status == "below": assessment = "subtherapeutic (inadequate peak)"
-    elif trough_status == "above": assessment = "potentially toxic (elevated trough)"
-    elif peak_status == "above": assessment = "potentially toxic (elevated peak)"
-    elif peak_status == "within" and trough_status == "within": assessment = "appropriately dosed"
-    else: assessment = "requires adjustment" # Mixed scenarios
-
-    # Generate recommendations
-    dosing_recs = []
-    monitoring_recs = []
-    cautions = []
-
-    # Format recommended dose/interval if available
-    rounded_new_dose_str = ""
-    new_interval_str = f"q{new_interval_rec}h" if new_interval_rec else "(interval adjustment may be needed)"
-    if new_dose_rec:
-        rounded_dose = round(new_dose_rec / 10) * 10 # Round to nearest 10mg
-        rounded_new_dose_str = f"{int(rounded_dose)}mg {new_interval_str}"
-
-    # Tailor recommendations
-    if "subtherapeutic" in assessment or "ineffective" in assessment:
-        action = f"INCREASE dose to {rounded_new_dose_str}" if rounded_new_dose_str else "INCREASE dose (e.g., by 25-50%)"
-        dosing_recs.append(action)
-        if "ineffective" in assessment: dosing_recs.append("EXTEND interval if trough is high")
-        monitoring_recs.append("RECHECK peak and trough after 2-3 doses")
-        cautions.append("Subtherapeutic levels risk treatment failure.")
-    elif "toxic" in assessment:
-        if "trough" in assessment:
-             action = f"EXTEND dosing interval to {new_interval_str}" if new_interval_rec else "EXTEND dosing interval"
-             dosing_recs.append(action)
-             if rounded_new_dose_str: dosing_recs.append(f"CONSIDER decreasing dose to {rounded_new_dose_str}")
-             cautions.append("Elevated trough increases risk of nephrotoxicity and ototoxicity.")
-        elif "peak" in assessment:
-             action = f"DECREASE dose to {rounded_new_dose_str}" if rounded_new_dose_str else "DECREASE dose (e.g., by 20-25%)"
-             dosing_recs.append(action)
-             cautions.append("Elevated peak may increase risk of ototoxicity.")
-        monitoring_recs.append("RECHECK peak and trough after adjustment")
-        monitoring_recs.append("MONITOR renal function and hearing closely")
-    elif "appropriately dosed" in assessment:
-        dosing_recs.append("CONTINUE current dosing regimen")
-        monitoring_recs.append("ROUTINE monitoring: Recheck levels if clinical status or renal function changes.")
-        if regimen == "MDD": monitoring_recs.append("CONSIDER switching to SDD if appropriate for indication and duration.")
-    else: # requires adjustment / requires clinical correlation
-        action = f"ADJUST dose/interval towards {rounded_new_dose_str}" if rounded_new_dose_str else "ADJUST dose/interval based on clinical picture and levels"
-        dosing_recs.append(action)
-        monitoring_recs.append("RECHECK peak and trough after adjustment")
-        cautions.append("Individualize therapy based on clinical response and specific targets.")
-
-    # Standard monitoring
-    monitoring_recs.append("MONITOR renal function regularly (e.g., every 1-3 days)")
-    monitoring_recs.append("MONITOR for signs/symptoms of ototoxicity (hearing loss, tinnitus, vertigo)")
-
-    return levels_data, assessment, dosing_recs, monitoring_recs, cautions
-
-
-# ===== FORMAT_CLINICAL_RECOMMENDATIONS FUNCTION =====
-def format_clinical_recommendations(levels_data, assessment, dosing_recs, monitoring_recs, cautions=None):
-    """
-    Create standardized recommendation format with clear visual hierarchy using markdown.
-    """
-    # Format measured levels with status indicators
-    levels_md = "📊 **MEASURED LEVELS:**\n"
-    if levels_data:
-        for name, value, target, status in levels_data:
-            # Use emojis for status indicators
-            icon = "✅" if status == "within" else "⬇️" if status == "below" else "⬆️"
-            levels_md += f"- {name}: **{value}** (Target: {target}) {icon}\n"
-    else:
-        levels_md += "- *No level data processed for interpretation.*\n"
-
-    # Format overall assessment
-    assessment_md = f"⚕️ **ASSESSMENT:**\n**{assessment.upper()}**"
-
-    # Combine into full recommendation format
-    output = f"""## CLINICAL ASSESSMENT & RECOMMENDATIONS
-
-{levels_md}
-{assessment_md}
-
----
-
-### DETAILED RECOMMENDATIONS
-
-🔵 **DOSING RECOMMENDATIONS:**
-"""
-    if dosing_recs:
-        for rec in dosing_recs:
-            output += f"- {rec}\n"
-    else:
-        output += "- *No specific dosing recommendations generated.*\n"
-
-    output += "\n🔵 **MONITORING RECOMMENDATIONS:**\n"
-    if monitoring_recs:
-        for rec in monitoring_recs:
-            output += f"- {rec}\n"
-    else:
-        output += "- *No specific monitoring recommendations generated.*\n"
-
-    if cautions and len(cautions) > 0:
-        output += "\n⚠️ **CAUTIONS & CONSIDERATIONS:**\n"
-        for caution in cautions:
-            output += f"- {caution}\n"
-
-    # Add a summary section for quick reference
-    output += "\n---\n" # Separator
-    output += "### QUICK SUMMARY\n"
-    output += f"**Status:** {assessment.upper()}\n"
-
-    # Summarize key recommendations
-    if dosing_recs:
-        output += f"**Key Dosing Action:** {dosing_recs[0]}\n"
-    if monitoring_recs:
-        output += f"**Key Monitoring Action:** {monitoring_recs[0]}\n"
-
-    # Add timestamp
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    output += f"\n*Generated on: {timestamp}*"
-
-    return output
-
-# ===== STANDARDIZED INTERPRETATION GENERATOR (Router) =====
-def generate_standardized_interpretation(prompt, drug):
-    """
-    Generate a standardized interpretation based on drug type and prompt content.
-    Calls specific drug interpretation functions.
-    """
-    drug_lower = drug.lower()
-    if "vancomycin" in drug_lower:
-        return generate_vancomycin_interpretation(prompt)
-    elif "aminoglycoside" in drug_lower or "gentamicin" in drug_lower or "amikacin" in drug_lower:
-        return generate_aminoglycoside_interpretation(prompt)
-    else:
-        # Fallback for unknown drugs
-        levels_data = [("Unknown Drug", "N/A", "N/A", "N/A")]
-        assessment = "requires specific assessment for this drug"
-        dosing_recs = ["CONSULT pharmacist/specialist", "FOLLOW institutional guidelines"]
-        monitoring_recs = ["OBTAIN appropriate levels based on drug type", "MONITOR clinical response and toxicity"]
-        cautions = ["Standard TDM principles may not apply.", "Verify drug identity."]
-        return levels_data, assessment, dosing_recs, monitoring_recs, cautions
-
-# ===== IMPROVED CLINICAL INTERPRETATION FUNCTION (Wrapper) =====
-# This function seems redundant if generate_standardized_interpretation handles the logic.
-# Kept for compatibility with original structure, but consider refactoring.
-def interpret_with_llm(prompt, patient_data=None, calculation_details=None):
-    """
-    Enhanced clinical interpretation function. Uses OpenAI if available,
-    otherwise falls back to generate_standardized_interpretation.
-    """
-    # Extract drug type and method for display/PDF
-    drug = "Antimicrobial"
-    method = "Standard method"
+    # Extract the drug type from the prompt
     if "Vancomycin" in prompt:
         drug = "Vancomycin"
-        if "Trough only" in prompt: method = "Trough-only"
-        elif "Peak and Trough" in prompt: method = "Peak and Trough"
-        elif "AUC-guided" in prompt: method = "AUC-guided"
-    elif "Gentamicin" in prompt: drug = "Gentamicin"
-    elif "Amikacin" in prompt: drug = "Amikacin"
-    elif "Aminoglycoside" in prompt: drug = "Aminoglycoside"
-
-    if drug != "Antimicrobial":
-        if "SDD" in prompt: method = "SDD"
-        elif "Synergy" in prompt: method = "Synergy"
-        elif "MDD" in prompt: method = "MDD"
-
+        if "Trough only" in prompt:
+            method = "Trough-only method"
+        else:
+            method = "Peak and Trough method"
+    elif "Aminoglycoside" in prompt:
+        drug = "Aminoglycoside"
+        if "Initial Dose" in prompt:
+            method = "Initial dosing"
+        else:
+            method = "Conventional (C1/C2) method"
+    else:
+        drug = "Antimicrobial"
+        method = "Standard method"
+    
     drug_info = f"{drug} ({method})"
-
+    
     # Check if OpenAI API is available and configured
-    if OPENAI_AVAILABLE:
+    if OPENAI_AVAILABLE and openai.api_key:
         try:
-            # Updated prompt for structured output (Example)
+            # Updated prompt to guide the LLM to provide structured outputs
             structured_prompt = f"""
             Provide a concise, structured clinical interpretation for this antimicrobial TDM case.
-            Format your response using markdown with these exact sections:
+            Format your response with these exact sections:
+            
             ## CLINICAL ASSESSMENT
-            **MEASURED LEVELS:** (list each with target range and status icon ✅⬇️⬆️)
-            **ASSESSMENT:** (state if appropriately dosed, subtherapeutic, or potentially toxic)
+            📊 **MEASURED LEVELS:** (list each with target range and status icon ✅⚠️🔴)
+            ⚕️ **ASSESSMENT:** (state if appropriately dosed, underdosed, or overdosed)
+            
             ## RECOMMENDATIONS
-            **DOSING:** (action-oriented recommendations)
-            **MONITORING:** (specific parameters and schedule)
-            **CAUTIONS:** (relevant warnings, if any)
-
-            Case: {prompt}
+            🔵 **DOSING:** (action-oriented recommendations using verbs like CONTINUE, ADJUST, HOLD)
+            🔵 **MONITORING:** (specific monitoring parameters and schedule)
+            ⚠️ **CAUTIONS:** (relevant warnings, if any)
+            
+            Here is the case: {prompt}
             """
-
-            # Call OpenAI API
+            
+            # Call OpenAI API - updated for openai v1.0.0+
             response = openai.chat.completions.create(
-                model="gpt-4", # Or your preferred model like gpt-3.5-turbo
+                model="gpt-4",  # or your preferred model
                 messages=[
-                    {"role": "system", "content": "You are an expert clinical pharmacist specializing in TDM. Provide concise, evidence-based interpretations with clear recommendations."},
+                    {"role": "system", "content": "You are an expert clinical pharmacist specializing in therapeutic drug monitoring. Provide concise, evidence-based interpretations with clear recommendations."},
                     {"role": "user", "content": structured_prompt}
                 ],
                 temperature=0.3,
                 max_tokens=500
             )
             llm_response = response.choices[0].message.content
-
-            st.markdown("---")
-            st.subheader("Clinical Interpretation (AI Generated)")
-            st.markdown(llm_response)
-            st.info("Interpretation provided by OpenAI. Always verify with clinical judgment.")
-            # Skip standardized formatting and PDF for LLM response for simplicity here
-            return # Exit after displaying LLM response
-
+            st.write(llm_response)
+            
+            # Add a note about source
+            st.info("Interpretation provided by OpenAI GPT-4. Always verify with clinical judgment.")
+            
+            # We can't easily extract the structured data from the LLM response for PDF generation
+            # So we'll skip the PDF option for the OpenAI path for now
+            return
         except Exception as e:
             st.error(f"Error calling OpenAI API: {e}")
-            st.warning("Falling back to rule-based clinical interpretation.")
-
-    # --- Fallback to Rule-Based Interpretation ---
-    st.markdown("---")
-    st.subheader("Clinical Interpretation (Rule-Based)")
+            st.warning("Falling back to simulated clinical interpretation.")
+    
+    # Format the standardized clinical interpretation
     interpretation_data = generate_standardized_interpretation(prompt, drug)
-
-    if isinstance(interpretation_data, str): # Handle error string
-        st.error(interpretation_data)
+    
+    # If the interpretation_data is a string (error message), just display it and return
+    if isinstance(interpretation_data, str):
+        st.write(interpretation_data)
         return
-
+    
     # Unpack the interpretation data
     levels_data, assessment, dosing_recs, monitoring_recs, cautions = interpretation_data
-
+    
     # Display the formatted interpretation
     formatted_interpretation = format_clinical_recommendations(levels_data, assessment, dosing_recs, monitoring_recs, cautions)
-    st.markdown(formatted_interpretation) # Use markdown for better formatting
-
+    st.write(formatted_interpretation)
+    
     # Add the PDF download button if patient_data is provided
-    if patient_data and REPORTLAB_AVAILABLE:
+    if patient_data:
         display_pdf_download_button(
-            patient_data, drug_info, levels_data, assessment,
-            dosing_recs, monitoring_recs, calculation_details, cautions
+            patient_data, 
+            drug_info, 
+            levels_data, 
+            assessment, 
+            dosing_recs, 
+            monitoring_recs, 
+            cautions
         )
-    elif patient_data:
-        st.warning("PDF generation disabled because ReportLab library is not installed.")
-
+    
     # Add the raw prompt at the bottom for debugging
-    with st.expander("View Raw Data Used for Interpretation", expanded=False):
+    with st.expander("Raw Analysis Data", expanded=False):
         st.code(prompt)
+        
+    # Add note about simulated response
+    st.info("Simulated interpretation. For production use, configure OpenAI API in Streamlit secrets.toml")
 
+def generate_standardized_interpretation(prompt, drug):
+    """
+    Generate a standardized interpretation based on drug type and prompt content
+    
+    Returns a tuple of:
+    - levels_data: List of tuples (name, value, target, status)
+    - assessment: String of assessment
+    - dosing_recs: List of dosing recommendations
+    - monitoring_recs: List of monitoring recommendations 
+    - cautions: List of cautions
+    
+    Or returns a string if insufficient data
+    """
+    if drug == "Vancomycin":
+        return generate_vancomycin_interpretation(prompt)
+    elif drug == "Aminoglycoside":
+        return generate_aminoglycoside_interpretation(prompt)
+    else:
+        # For generic, we'll create a simple placeholder
+        levels_data = [("Not available", "N/A", "N/A", "within")]
+        assessment = "requires specific assessment"
+        dosing_recs = ["CONSULT antimicrobial stewardship team", "FOLLOW institutional guidelines"]
+        monitoring_recs = ["OBTAIN appropriate levels based on antimicrobial type", "MONITOR renal function regularly"]
+        cautions = ["Patient-specific factors may require dose adjustments"]
+        
+        return levels_data, assessment, dosing_recs, monitoring_recs, cautions
 
-# ===== VANCOMYCIN METHODS =====
-def vancomycin_trough_only(patient_data):
-    """Vancomycin trough-only monitoring method"""
-    st.markdown("---")
-    st.write("##### Trough-Only Monitoring")
-    st.info("Trough-only monitoring is a traditional approach. AUC-guided is now preferred by guidelines.")
+def format_clinical_recommendations(levels_data, assessment, dosing_recs, monitoring_recs, cautions=None):
+    """
+    Create standardized recommendation format with clear visual hierarchy
+    
+    Parameters:
+    - levels_data: List of tuples (name, value, target, status) for each measured level
+    - assessment: Overall assessment string (e.g., "appropriately dosed")
+    - dosing_recs: List of dosing recommendation strings
+    - monitoring_recs: List of monitoring recommendation strings
+    - cautions: Optional list of caution strings
+    
+    Returns:
+    - Formatted markdown string
+    """
+    # Format measured levels with status indicators
+    levels_md = "📊 **MEASURED LEVELS:**\n"
+    for name, value, target, status in levels_data:
+        icon = "✅" if status == "within" else "⚠️" if status == "below" else "🔴"
+        levels_md += f"- {name}: {value} (Target: {target}) {icon}\n"
+    
+    # Format overall assessment
+    assessment_md = f"⚕️ **ASSESSMENT:**\nPatient is {assessment.upper()}"
+    
+    # Combine into full recommendation format
+    output = f"""## CLINICAL ASSESSMENT
 
-    target_trough_strategy = st.radio(
-        "Target Trough Range",
-        ["Empirical (10-15 mg/L)", "Definitive (15-20 mg/L)"],
-        key="vanco_trough_target", help="Select appropriate target based on indication"
-    )
-    target_cmin = (10, 15) if "Empirical" in target_trough_strategy else (15, 20)
+{levels_md}
+{assessment_md}
 
-    col1, col2 = st.columns(2)
-    with col1:
-        dose = st.number_input("Current Dose (mg)", min_value=250, max_value=5000, value=1000, step=250, key="vanco_trough_dose")
-        interval = st.number_input("Dosing Interval (hours)", min_value=6, max_value=72, value=12, step=4, key="vanco_trough_interval")
-    with col2:
-        trough = st.number_input("Measured Trough (mg/L)", min_value=0.0, max_value=100.0, value=12.5, step=0.1, key="vanco_trough_level")
-        infusion_time = st.number_input("Infusion Duration (hours)", min_value=0.5, max_value=4.0, value=1.0, step=0.5, key="vanco_trough_infusion")
+## RECOMMENDATIONS
 
-    if st.button("Calculate Vancomycin Trough Dosing", key="vanco_trough_calc"):
-        with st.spinner("Performing trough-based calculations..."):
-            crcl = patient_data.get('crcl', 0)
-            weight = patient_data.get('weight', 0)
-            if crcl <= 0 or weight <= 0:
-                st.error("Valid CrCl and Weight are required for calculations.")
-                return
+🔵 **DOSING:**
+"""
+    for rec in dosing_recs:
+        output += f"- {rec}\n"
+    
+    output += "\n🔵 **MONITORING:**\n"
+    for rec in monitoring_recs:
+        output += f"- {rec}\n"
+    
+    if cautions and len(cautions) > 0:
+        output += "\n⚠️ **CAUTIONS:**\n"
+        for caution in cautions:
+            output += f"- {caution}\n"
+    
+    return output
 
-            # Estimate PK parameters (using population estimates - less accurate)
-            ke = 0.00083 * crcl + 0.0044
-            vd = 0.7 * weight
-            if ke <= 0:
-                st.error("Estimated Ke is non-positive. Cannot proceed with calculation.")
-                return
-            t_half = 0.693 / ke
-            cl = ke * vd
-            tau = interval
-
-            # Estimate peak and AUC (highly approximate for trough-only)
-            try:
-                 # Formula requires non-zero ke, tau, vd
-                 if vd > 0 and tau > 0 and ke > 0:
-                      # Simplified peak estimation
-                      factor = 1 - math.exp(-ke * tau)
-                      if factor > 1e-9: # Avoid division by zero
-                           peak_est = (dose / vd) * (1 - math.exp(-ke * infusion_time)) / factor if infusion_time > 0 else (dose / vd) / factor
-                           auc24_est = (dose / cl) * (24 / tau) if cl > 0 and tau > 0 else 0
-                      else:
-                           peak_est = 0
-                           auc24_est = 0
-                 else:
-                      peak_est = 0
-                      auc24_est = 0
-
-            except Exception as e:
-                 st.warning(f"Could not estimate peak/AUC: {e}")
-                 peak_est = 0
-                 auc24_est = 0
-
-
-            # Calculate new dose to reach target trough (using estimated Cl)
-            target_trough = (target_cmin[0] + target_cmin[1]) / 2
-            new_dose = 0
-            if cl > 0 and tau > 0 and ke > 0:
-                 try:
-                      # Formula: Dose = Cpss_min * Cl * tau / (exp(-ke*inf_time)*(1-exp(-ke*tau))) # More complex
-                      # Simplified approach: Dose ~ Target * Vd * (1-exp(-ke*tau)) / exp(-ke*(tau-inf_time))
-                      # Using proportional adjustment based on current trough vs target
-                      if trough > 0: # Avoid division by zero
-                           new_dose = dose * (target_trough / trough)
-                      else:
-                           # If current trough is 0, estimate based on target and pop PK
-                           factor = 1 - math.exp(-ke * tau)
-                           if factor > 1e-9:
-                                new_dose = target_trough * vd * factor / math.exp(-ke * (tau - max(infusion_time, 0.5)))
-                           else:
-                                new_dose = 0 # Cannot calculate
-                 except Exception as e:
-                      st.warning(f"Error calculating new dose: {e}")
-                      new_dose = 0
+def generate_vancomycin_interpretation(prompt):
+    """
+    Generate standardized vancomycin interpretation
+    
+    Returns a tuple of:
+    - levels_data: List of tuples (name, value, target, status)
+    - assessment: String of assessment
+    - dosing_recs: List of dosing recommendations
+    - monitoring_recs: List of monitoring recommendations 
+    - cautions: List of cautions
+    
+    Or returns a string if insufficient data
+    """
+    # Extract key values from the prompt
+    trough_val = None
+    auc_val = None
+    target_range = None
+    current_dose = None
+    new_dose = None
+    crcl = None
+    interval = None
+    
+    # Parse for measured or estimated trough
+    if "Measured trough = " in prompt:
+        parts = prompt.split("Measured trough = ")
+        if len(parts) > 1:
+            trough_val = float(parts[1].split()[0])
+    elif "Estimated trough = " in prompt:
+        parts = prompt.split("Estimated trough = ")
+        if len(parts) > 1:
+            trough_val = float(parts[1].split()[0])
+    
+    # Parse for AUC
+    if "AUC24 = " in prompt:
+        parts = prompt.split("AUC24 = ")
+        if len(parts) > 1:
+            auc_val = float(parts[1].split()[0])
+    
+    # Parse for current dose
+    if "Current dose = " in prompt:
+        parts = prompt.split("Current dose = ")
+        if len(parts) > 1:
+            current_dose = float(parts[1].split()[0])
+    
+    # Parse for interval
+    if "Dosing interval = " in prompt:
+        parts = prompt.split("Dosing interval = ")
+        if len(parts) > 1:
+            interval = float(parts[1].split()[0])
+    
+    # Parse for CrCl
+    if "CrCl = " in prompt:
+        parts = prompt.split("CrCl = ")
+        if len(parts) > 1:
+            crcl = float(parts[1].split()[0])
+    
+    # Parse for target range
+    if "Target trough range = " in prompt:
+        parts = prompt.split("Target trough range = ")
+        if len(parts) > 1:
+            range_str = parts[1].strip()
+            # Extract numbers from range
+            import re
+            numbers = re.findall(r'\d+', range_str)
+            if len(numbers) >= 2:
+                target_min = int(numbers[0])
+                target_max = int(numbers[1])
+                target_range = f"{target_min}-{target_max} mg/L"
             else:
-                 st.warning("Cannot calculate new dose due to invalid PK parameters.")
+                target_range = range_str
+    
+    # Get new dose if available
+    if "Recommended new TDD" in prompt:
+        parts = prompt.split("Recommended new TDD")
+        if len(parts) > 1:
+            dose_part = parts[1].split("mg/day")[0]
+            import re
+            dose_numbers = re.findall(r'\d+', dose_part)
+            if dose_numbers:
+                new_dose = float(dose_numbers[0])
+    
+    # Create a styled interpretation
+    if trough_val is not None and auc_val is not None and target_range is not None:
+        # Get target trough values
+        target_parts = target_range.split("-")
+        if len(target_parts) == 2:
+            try:
+                target_min = float(target_parts[0])
+                target_max = float(target_parts[1].split()[0])  # Extract number before unit
+            except ValueError:
+                target_min = 10
+                target_max = 20
+        else:
+            target_min = 10
+            target_max = 20
+        
+        # Determine trough status
+        if trough_val < target_min:
+            trough_status = "below"
+        elif trough_val > target_max:
+            trough_status = "above"
+        else:
+            trough_status = "within"
+        
+        # Determine AUC status
+        if auc_val < 400:
+            auc_status = "below"
+        elif auc_val > 600:
+            auc_status = "above"
+        else:
+            auc_status = "within"
+        
+        # Round and format new dose if available
+        practical_dose_str = ""
+        if new_dose:
+            # Round to the nearest 250mg for doses ≥ 1000mg
+            if new_dose >= 1000:
+                rounded_dose = round(new_dose / 250) * 250
+                if rounded_dose >= 1000:
+                    practical_dose_str = f"{rounded_dose/1000:.1f}g" if rounded_dose % 1000 != 0 else f"{int(rounded_dose/1000)}g"
+                else:
+                    practical_dose_str = f"{int(rounded_dose)}mg"
+            # Round to the nearest 50mg for doses < 1000mg
+            else:
+                rounded_dose = round(new_dose / 50) * 50
+                practical_dose_str = f"{int(rounded_dose)}mg"
+        
+        # Create practical dosing regimen suggestion
+        practical_regimen = ""
+        if practical_dose_str and interval:
+            if interval == 12:
+                # Split into two equal doses
+                single_dose = float(rounded_dose) / 2
+                if single_dose >= 1000:
+                    single_dose_str = f"{single_dose/1000:.1f}g" if single_dose % 1000 != 0 else f"{int(single_dose/1000)}g"
+                else:
+                    single_dose_str = f"{int(single_dose)}mg"
+                practical_regimen = f"{single_dose_str} q12h"
+            elif interval == 24:
+                practical_regimen = f"{practical_dose_str} q24h"
+            elif interval == 8:
+                # Split into three equal doses
+                single_dose = float(rounded_dose) / 3
+                single_dose = round(single_dose / 50) * 50  # Round to nearest 50mg
+                single_dose_str = f"{int(single_dose)}mg"
+                practical_regimen = f"{single_dose_str} q8h"
+        
+        # Determine renal function status
+        renal_status = ""
+        if crcl is not None:
+            if crcl >= 90:
+                renal_status = "normal"
+            elif crcl >= 60:
+                renal_status = "mildly impaired"
+            elif crcl >= 30:
+                renal_status = "moderately impaired"
+            elif crcl >= 15:
+                renal_status = "severely impaired"
+            else:
+                renal_status = "in kidney failure"
+        
+        # Determine vancomycin status for overall assessment
+        if trough_val < target_min and auc_val < 400:
+            status = "significantly underdosed"
+        elif trough_val < target_min:
+            status = "underdosed (trough below target)"
+        elif auc_val < 400:
+            status = "underdosed (AUC below target)"
+        elif trough_val > target_max and auc_val > 600:
+            status = "significantly overdosed"
+        elif trough_val > target_max:
+            status = "overdosed (trough above target)"
+        elif auc_val > 600:
+            status = "overdosed (AUC above target)"
+        else:
+            status = "appropriately dosed"
+        
+        # Prepare data for the standardized format
+        levels_data = [
+            ("Trough", f"{trough_val:.1f} mg/L", target_range, trough_status),
+            ("AUC24", f"{auc_val:.1f} mg·hr/L", "400-600 mg·hr/L", auc_status)
+        ]
+        
+        # Generate appropriate recommendations based on status
+        dosing_recs = []
+        monitoring_recs = []
+        cautions = []
+        
+        if trough_val < target_min or auc_val < 400:
+            if trough_val < target_min * 0.7 or auc_val < 300:  # Severely underdosed
+                dosing_recs.append("INCREASE dose significantly")
+            else:
+                dosing_recs.append("INCREASE dose")
+                
+            if practical_dose_str:
+                if practical_regimen:
+                    dosing_recs.append(f"ADJUST to {practical_regimen} ({practical_dose_str}/day)")
+                else:
+                    dosing_recs.append(f"ADJUST to {practical_dose_str}/day")
+            
+            monitoring_recs.append("RECHECK levels after 3-4 doses (at steady state)")
+            
+            if crcl and crcl < 60:
+                monitoring_recs.append("MONITOR renal function every 48 hours")
+                cautions.append(f"Patient has {renal_status} renal function (CrCl: {crcl:.1f} mL/min)")
+        
+        elif trough_val > target_max or auc_val > 600:
+            if trough_val > 20:
+                dosing_recs.append("HOLD next dose")
+                cautions.append("High trough increases nephrotoxicity risk")
+            
+            dosing_recs.append("DECREASE dose")
+            
+            if practical_dose_str:
+                if practical_regimen:
+                    dosing_recs.append(f"ADJUST to {practical_regimen} ({practical_dose_str}/day)")
+                else:
+                    dosing_recs.append(f"ADJUST to {practical_dose_str}/day")
+            
+            monitoring_recs.append("RECHECK levels within 24-48 hours")
+            monitoring_recs.append("MONITOR renal function daily")
+            
+            if crcl and crcl < 60:
+                cautions.append(f"Patient has {renal_status} renal function (CrCl: {crcl:.1f} mL/min)")
+        
+        else:
+            dosing_recs.append("CONTINUE current regimen")
+            
+            if current_dose:
+                current_daily = current_dose
+                if interval:
+                    current_q = current_daily / (24/interval)
+                    dosing_recs.append(f"MAINTAIN {current_q:.0f}mg q{interval:.0f}h ({current_daily:.0f}mg/day)")
+            
+            monitoring_recs.append("MONITOR renal function per protocol")
+            monitoring_recs.append("REPEAT levels if clinical status changes")
+        
+        # Add standard cautions for vancomycin
+        if crcl and crcl < 30:
+            cautions.append("Increased risk of nephrotoxicity with severe renal impairment")
+        
+        return levels_data, status, dosing_recs, monitoring_recs, cautions
+    
+    return "Insufficient data to generate a clinical interpretation."
 
+def generate_aminoglycoside_interpretation(prompt):
+    """
+    Generate standardized aminoglycoside interpretation
+    
+    Returns a tuple of:
+    - levels_data: List of tuples (name, value, target, status)
+    - assessment: String of assessment
+    - dosing_recs: List of dosing recommendations
+    - monitoring_recs: List of monitoring recommendations 
+    - cautions: List of cautions
+    
+    Or returns a string if insufficient data
+    """
+    # Extract key values from the prompt
+    drug_name = "aminoglycoside"
+    peak_val = None
+    trough_val = None
+    
+    if "Gentamicin" in prompt:
+        drug_name = "gentamicin"
+    elif "Amikacin" in prompt:
+        drug_name = "amikacin"
+    
+    # Extract peak and trough values
+    if "Cmax:" in prompt:
+        parts = prompt.split("Cmax:")
+        if len(parts) > 1:
+            peak_parts = parts[1].split(",")
+            if peak_parts:
+                try:
+                    peak_val = float(peak_parts[0])
+                except ValueError:
+                    pass
+    
+    if "Cmin:" in prompt:
+        parts = prompt.split("Cmin:")
+        if len(parts) > 1:
+            trough_parts = parts[1].split(",")
+            if trough_parts:
+                try:
+                    trough_val = float(trough_parts[0])
+                except ValueError:
+                    pass
+    
+    # Extract dose
+    dose = None
+    if "Dose:" in prompt:
+        parts = prompt.split("Dose:")
+        if len(parts) > 1:
+            dose_parts = parts[1].split("mg")
+            if dose_parts:
+                try:
+                    dose = float(dose_parts[0])
+                except ValueError:
+                    pass
+    
+    # Extract suggested new dose
+    new_dose = None
+    if "Suggested new dose:" in prompt:
+        parts = prompt.split("Suggested new dose:")
+        if len(parts) > 1:
+            new_dose_parts = parts[1].split("mg")
+            if new_dose_parts:
+                try:
+                    new_dose = float(new_dose_parts[0])
+                except ValueError:
+                    pass
+    
+    # Set target ranges based on drug
+    if drug_name == "gentamicin":
+        peak_target = "5-10 mg/L"
+        trough_target = "<2 mg/L"
+        peak_min, peak_max = 5, 10
+        trough_max = 2
+    elif drug_name == "amikacin":
+        peak_target = "20-30 mg/L"
+        trough_target = "<10 mg/L"
+        peak_min, peak_max = 20, 30
+        trough_max = 10
+    else:
+        peak_target = "varies by drug"
+        trough_target = "varies by drug"
+        peak_min, peak_max = 0, 100
+        trough_max = 10
+    
+    # Determine aminoglycoside status
+    status = "assessment not available"
+    if peak_val and trough_val:
+        if peak_val < peak_min and trough_val > trough_max:
+            status = "ineffective and potentially toxic"
+        elif peak_val < peak_min:
+            status = "subtherapeutic (inadequate peak)"
+        elif trough_val > trough_max:
+            status = "potentially toxic (elevated trough)"
+        elif peak_min <= peak_val <= peak_max and trough_val <= trough_max:
+            status = "appropriately dosed"
+        elif peak_val > peak_max:
+            status = "potentially toxic (elevated peak)"
+        else:
+            status = "requires adjustment"
+    
+    # Format new dose
+    rounded_new_dose = None
+    if new_dose:
+        # Round to nearest 10mg for most aminoglycosides
+        rounded_new_dose = round(new_dose / 10) * 10
+    
+    # Create interpretation using standardized format
+    if peak_val is not None and trough_val is not None:
+        # Determine peak status
+        if peak_val < peak_min:
+            peak_status = "below"
+        elif peak_val > peak_max:
+            peak_status = "above"
+        else:
+            peak_status = "within"
+        
+        # Determine trough status
+        if trough_val > trough_max:
+            trough_status = "above"
+        else:
+            trough_status = "within"
+        
+        # Prepare data for standardized format
+        levels_data = [
+            (f"Peak", f"{peak_val:.1f} mg/L", peak_target, peak_status),
+            (f"Trough", f"{trough_val:.2f} mg/L", trough_target, trough_status)
+        ]
+        
+        # Generate recommendations based on status
+        dosing_recs = []
+        monitoring_recs = []
+        cautions = []
+        
+        if status == "ineffective and potentially toxic":
+            dosing_recs.append("HOLD next dose")
+            dosing_recs.append("REASSESS renal function before resuming")
+            if rounded_new_dose:
+                dosing_recs.append(f"DECREASE to {rounded_new_dose}mg when resumed")
+            dosing_recs.append("EXTEND dosing interval significantly")
+            
+            monitoring_recs.append("CHECK renal function before resuming therapy")
+            monitoring_recs.append("RECHECK levels 2 doses after resumption")
+            
+            cautions.append("High risk of toxicity with current levels")
+            cautions.append("Monitor for ototoxicity and nephrotoxicity")
+        
+        elif status == "subtherapeutic (inadequate peak)":
+            dosing_recs.append("INCREASE dose")
+            if rounded_new_dose:
+                dosing_recs.append(f"ADJUST to {rounded_new_dose}mg")
+            dosing_recs.append("MAINTAIN current interval")
+            
+            monitoring_recs.append("RECHECK levels after next dose")
+            
+            if drug_name == "gentamicin":
+                cautions.append("Inadequate peak may reduce efficacy against gram-negative infections")
+            elif drug_name == "amikacin":
+                cautions.append("Inadequate peak may reduce efficacy against resistant organisms")
+        
+        elif status == "potentially toxic (elevated trough)":
+            dosing_recs.append("EXTEND dosing interval")
+            dosing_recs.append("MAINTAIN current dose amount")
+            
+            monitoring_recs.append("MONITOR renal function closely")
+            monitoring_recs.append("RECHECK levels after adjustment")
+            
+            cautions.append("Elevated trough increases risk of nephrotoxicity and ototoxicity")
+            cautions.append("Consider once-daily dosing if appropriate for infection type")
+        
+        elif status == "potentially toxic (elevated peak)":
+            dosing_recs.append("DECREASE dose")
+            if rounded_new_dose:
+                dosing_recs.append(f"ADJUST to {rounded_new_dose}mg")
+            dosing_recs.append("MAINTAIN current interval")
+            
+            monitoring_recs.append("MONITOR for signs of toxicity")
+            monitoring_recs.append("RECHECK levels after adjustment")
+            
+            cautions.append("Watch for signs of vestibular dysfunction or hearing loss")
+        
+        elif status == "appropriately dosed":
+            dosing_recs.append("CONTINUE current regimen")
+            if dose:
+                dosing_recs.append(f"MAINTAIN {dose}mg dose")
+            
+            monitoring_recs.append("MONITOR renal function regularly")
+            monitoring_recs.append("No further TDM needed unless clinical status changes")
+            
+            if drug_name == "amikacin" or drug_name == "gentamicin":
+                cautions.append(f"Extended therapy (>7 days) increases toxicity risk")
+        
+        return levels_data, status, dosing_recs, monitoring_recs, cautions
+    
+    return "Insufficient data to generate a clinical interpretation."
 
-            practical_new_dose = round(new_dose / 250) * 250 if new_dose > 0 else 0
+# ===== SIDEBAR: NAVIGATION AND PATIENT INFO =====
+def setup_sidebar_and_navigation():
+    st.sidebar.title("📊 Navigation")
+    # Sidebar radio for selecting the module – make sure the labels exactly match with your conditions below.
+    page = st.sidebar.radio("Select Module", [
+        "Aminoglycoside: Initial Dose",
+        "Aminoglycoside: Conventional Dosing (C1/C2)",
+        "Vancomycin AUC-based Dosing"
+    ])
 
-            # Display results
-            st.success("Vancomycin Trough Analysis Complete (using population estimates)")
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Measured Trough", f"{trough:.1f} mg/L")
-                st.metric("Target Trough", f"{target_cmin[0]}-{target_cmin[1]} mg/L")
-                if trough < target_cmin[0]: st.warning("⚠️ Trough below target")
-                elif trough > target_cmin[1]: st.warning("⚠️ Trough above target")
-                else: st.success("✅ Trough within target")
-            with col2:
-                st.metric("Est. Ke", f"{ke:.4f} hr⁻¹")
-                st.metric("Est. t½", f"{t_half:.1f} hr")
-                st.metric("Est. Vd", f"{vd:.1f} L")
-            with col3:
-                st.metric("Est. Cl", f"{cl:.2f} L/hr")
-                st.metric("Est. AUC24", f"{auc24_est:.0f} mg·hr/L", help="Highly approximate")
-                st.metric("Recommended Dose", f"{practical_new_dose:.0f} mg q{tau}h", help="Based on target trough")
+    st.sidebar.title("🩺 Patient Demographics")
+    gender = st.sidebar.selectbox("Gender", ["Male", "Female"])
+    age = st.sidebar.number_input("Age (years)", min_value=0, value=65)
+    height = st.sidebar.number_input("Height (cm)", min_value=50, value=165)
+    weight = st.sidebar.number_input("Weight (kg)", min_value=1.0, value=70.0)
+    serum_cr = st.sidebar.number_input("Serum Creatinine (µmol/L)", min_value=10.0, value=90.0)
 
-            # Interpretation
-            calculation_details = f"""
-            Method: Trough-Only (Population Estimates)
-            Est. Ke = {ke:.4f} hr⁻¹
-            Est. t½ = {t_half:.1f} hr
-            Est. Vd = {vd:.1f} L
-            Est. Cl = {cl:.2f} L/hr
-            Measured Trough = {trough:.1f} mg/L
-            Target Trough = {target_cmin[0]}-{target_cmin[1]} mg/L
-            Est. AUC24 = {auc24_est:.0f} mg·hr/L (Approx.)
-            Recommended Dose = {practical_new_dose:.0f} mg q{tau}h (to target trough)
-            """
-            prompt = (
-                f"Vancomycin (Trough only): Measured trough = {trough} mg/L, "
-                f"Interval = {tau} hr, Target trough range = {target_cmin[0]}-{target_cmin[1]} mg/L, "
-                f"Recommended base dose = {practical_new_dose:.0f} mg."
-            )
-            interpret_with_llm(prompt, patient_data, calculation_details)
+    # Calculate Cockcroft-Gault Creatinine Clearance
+    with st.sidebar.expander("Creatinine Clearance (Cockcroft-Gault)", expanded=True):
+        # Calculate creatinine clearance using Cockcroft-Gault formula
+        crcl = ((140 - age) * weight * (1.23 if gender == "Male" else 1.04)) / serum_cr
+        st.success(f"CrCl: {crcl:.1f} mL/min")
+        
+        # Display renal function category
+        if crcl >= 90:
+            renal_function = "Normal"
+        elif crcl >= 60:
+            renal_function = "Mild Impairment"
+        elif crcl >= 30:
+            renal_function = "Moderate Impairment"
+        elif crcl >= 15:
+            renal_function = "Severe Impairment"
+        else:
+            renal_function = "Kidney Failure"
+        
+        st.info(f"Renal Function: {renal_function}")
 
+    st.sidebar.title("🩺 Clinical Information")
+    clinical_diagnosis = st.sidebar.text_input("Diagnosis")
+    current_dose_regimen = st.sidebar.text_area("Current Dosing Regimen", value="1g IV q12h")
+    notes = st.sidebar.text_area("Other Clinical Notes", value="No known allergies.")
+    clinical_summary = f"Diagnosis: {clinical_diagnosis}\nRenal function: {renal_function} (CrCl: {crcl:.1f} mL/min)\nCurrent regimen: {current_dose_regimen}\nNotes: {notes}"
+    
+    st.sidebar.markdown("---")
+    st.sidebar.info("""
+    **Antimicrobial TDM App v1.0**
+    
+    Developed for therapeutic drug monitoring of antimicrobials.
+    
+    This app provides population PK estimates, AUC calculations, and dosing recommendations
+    for vancomycin and aminoglycosides based on current best practices.
+    
+    **Disclaimer:** This tool is designed to assist clinical decision making but does not replace
+    professional judgment. Always consult with a clinical pharmacist for complex cases.
+    """)
 
-def vancomycin_peak_trough(patient_data):
-    """Vancomycin peak and trough monitoring method"""
-    st.markdown("---")
-    st.write("##### Peak & Trough Monitoring")
-    st.info("Uses measured peak and trough for individualized PK parameter calculation.")
+    # Return all the data entered in the sidebar
+    return {
+        'page': page,
+        'gender': gender,
+        'age': age,
+        'height': height,
+        'weight': weight,
+        'serum_cr': serum_cr,
+        'crcl': crcl,
+        'renal_function': renal_function,
+        'clinical_diagnosis': clinical_diagnosis,
+        'current_dose_regimen': current_dose_regimen,
+        'notes': notes,
+        'clinical_summary': clinical_summary
+    }
 
-    target_trough_strategy = st.radio(
-        "Target Trough Range",
-        ["Empirical (10-15 mg/L)", "Definitive (15-20 mg/L)"],
-        key="vanco_peak_trough_target", help="Select appropriate target based on indication"
-    )
-    target_cmin = (10, 15) if "Empirical" in target_trough_strategy else (15, 20)
-    # Peak target is less emphasized now, but can be estimated/shown
-    target_peak = (25, 40) # Example range, often derived from AUC goals
-
+# ===== MODULE 1: Aminoglycoside Initial Dose =====
+def aminoglycoside_initial_dose(patient_data):
+    st.title("🧮 Aminoglycoside Initial Dose (Population PK)")
+    
+    # Unpack patient data for easier access
+    gender = patient_data['gender']
+    age = patient_data['age']
+    height = patient_data['height']
+    weight = patient_data['weight']
+    crcl = patient_data['crcl']
+    notes = patient_data['notes']
+    
+    # We'll use demographic data already entered in the sidebar
+    drug = st.selectbox("Drug", ["Gentamicin", "Amikacin"])
+    
+    # Add dosing regimen selection
+    regimen = st.selectbox("Therapeutic Goal", ["MDD", "SDD", "Synergy", "Hemodialysis", "Neonates"])
+    
+    # Set default target ranges based on regimen and drug
+    if drug == "Gentamicin":
+        if regimen == "MDD":
+            default_peak = 10.0
+            default_trough = 1.0
+            st.info("Target: Peak 5-10 mg/L, Trough <2 mg/L")
+        elif regimen == "SDD":
+            default_peak = 20.0
+            default_trough = 0.5
+            st.info("Target: Peak 10-30 mg/L, Trough <1 mg/L")
+        elif regimen == "Synergy":
+            default_peak = 4.0
+            default_trough = 0.5
+            st.info("Target: Peak 3-5 mg/L, Trough <1 mg/L")
+        elif regimen == "Hemodialysis":
+            default_peak = 8.0
+            default_trough = 1.0
+            st.info("Target: Peak monitoring not necessary, Trough <2 mg/L")
+        elif regimen == "Neonates":
+            default_peak = 8.0
+            default_trough = 0.5
+            st.info("Target: Peak 5-12 mg/L, Trough <1 mg/L")
+    else:  # Amikacin
+        if regimen == "MDD":
+            default_peak = 25.0
+            default_trough = 5.0
+            st.info("Target: Peak 20-30 mg/L, Trough <10 mg/L")
+        elif regimen == "SDD":
+            default_peak = 60.0
+            default_trough = 0.5
+            st.info("Target: Peak ~60 mg/L, Trough <1 mg/L")
+        elif regimen == "Synergy":
+            st.warning("Specific targets for Amikacin used in synergy are not established.")
+            default_peak = 25.0
+            default_trough = 5.0
+        elif regimen == "Hemodialysis":
+            default_peak = 25.0
+            default_trough = 5.0
+            st.info("Target: Peak monitoring not necessary, Trough <10 mg/L")
+        elif regimen == "Neonates":
+            default_peak = 25.0
+            default_trough = 2.5
+            st.info("Target: Peak 20-30 mg/L, Trough <5 mg/L")
+    
+    # For SDD regimens, add MIC input and adjust peak target
+    if regimen == "SDD":
+        st.markdown("*Note: Target peaks may be individualized based on MIC to achieve peak:MIC ratio of 10:1*")
+        mic = st.number_input("MIC (mg/L)", min_value=0.0, value=1.0, step=0.25)
+        recommended_peak = mic * 10
+        if recommended_peak > default_peak:
+            default_peak = recommended_peak
+        st.info(f"For MIC of {mic} mg/L, recommended peak is ≥{recommended_peak} mg/L")
+    
+    # Allow user to override target values if needed
     col1, col2 = st.columns(2)
     with col1:
-        dose = st.number_input("Current Dose (mg)", min_value=250, max_value=5000, value=1000, step=250, key="vanco_pt_dose")
-        interval = st.number_input("Dosing Interval (hours)", min_value=6, max_value=72, value=12, step=4, key="vanco_pt_interval")
-        peak = st.number_input("Measured Peak (mg/L)", min_value=0.1, max_value=100.0, value=25.0, step=0.1, key="vanco_pt_peak") # Min > 0
+        target_cmax = st.number_input("Target Cmax (mg/L)", value=default_peak)
     with col2:
-        infusion_time = st.number_input("Infusion Duration (hours)", min_value=0.5, max_value=4.0, value=1.0, step=0.5, key="vanco_pt_infusion")
-        peak_draw_time = st.number_input("Time After START of Infusion for Peak (hours)", min_value=infusion_time + 0.1, max_value=6.0, value=1.5, step=0.25, key="vanco_pt_peak_time", help="Must be after infusion ends")
-        trough = st.number_input("Measured Trough (mg/L)", min_value=0.0, max_value=100.0, value=12.5, step=0.1, key="vanco_pt_trough")
+        target_cmin = st.number_input("Target Cmin (mg/L)", value=default_trough)
+    
+    # Special case for patients on hemodialysis
+    is_hd = regimen == "Hemodialysis"
+    if is_hd:
+        st.info("For hemodialysis patients, doses are typically administered post-dialysis. Adjust interval based on dialysis schedule.")
+    
+    # Default tau based on regimen
+    default_tau = 24 if regimen == "SDD" else 8 if regimen == "MDD" else 12
+    tau = st.number_input("Dosing Interval (hr)", value=default_tau)
 
-    if st.button("Calculate Vancomycin Peak-Trough Dosing", key="vanco_pt_calc"):
-        with st.spinner("Performing peak-trough calculations..."):
-            weight = patient_data.get('weight', 0)
-            if weight <= 0:
-                st.error("Valid Weight is required for Vd/kg calculation.")
-                return
-            if peak <= trough or peak <=0 or trough < 0:
-                 st.error("Invalid levels: Peak must be > Trough and > 0.")
-                 return
-            if interval <= peak_draw_time:
-                 st.error("Dosing interval must be longer than the peak draw time.")
-                 return
+    # Adjust calculations for neonates
+    if regimen == "Neonates":
+        st.warning("This calculation uses adult PK parameters. Consult a pediatric clinical pharmacist for neonatal dosing.")
+        
+    # Calculate IBW and dosing weight
+    ibw = 50 + 0.9 * (height - 152) if gender == "Male" else 45.5 + 0.9 * (height - 152)
+    abw_ibw_ratio = weight / ibw
+    
+    if abw_ibw_ratio > 1.2:
+        dosing_weight = ibw + 0.4 * (weight - ibw)
+        weight_used = "Adjusted Body Weight"
+    elif abw_ibw_ratio > 0.9:
+        dosing_weight = weight
+        weight_used = "Actual Body Weight"
+    elif abw_ibw_ratio > 0.75:
+        dosing_weight = ibw
+        weight_used = "Ideal Body Weight"
+    else:
+        dosing_weight = weight * 1.13
+        weight_used = "LBW x 1.13"
 
-            # Calculate individualized PK parameters
-            t_peak_actual = peak_draw_time # Time from start of infusion
-            tau = interval
-            delta_t = tau - t_peak_actual # Time between peak draw and trough draw (end of interval)
+    # Adjust Vd based on patient factors
+    base_vd = 0.3 if drug == "Amikacin" else 0.26
+    vd_adjustment = 1.0  # default no adjustment
+    
+    # Volume adjustments for special cases
+    if "ascites" in notes.lower() or "edema" in notes.lower() or "fluid overload" in notes.lower():
+        vd_adjustment = 1.1  # 10% increase
+        st.info("Vd adjusted for possible fluid overload based on clinical notes.")
+    
+    if "septic" in notes.lower() or "sepsis" in notes.lower():
+        vd_adjustment = 1.15  # 15% increase
+        st.info("Vd adjusted for possible sepsis based on clinical notes.")
+    
+    if "burn" in notes.lower():
+        vd_adjustment = 1.2  # 20% increase
+        st.info("Vd adjusted for possible burn injury based on clinical notes.")
+    
+    vd = base_vd * dosing_weight * vd_adjustment
+    
+    # Calculate clearance based on creatinine clearance
+    clamg = (crcl * 60) / 1000
+    ke = clamg / vd
+    t_half = 0.693 / ke
+    
+    # Calculate dose
+    dose = target_cmax * vd * (1 - np.exp(-ke * tau))
+    expected_cmax = dose / (vd * (1 - np.exp(-ke * tau)))
+    expected_cmin = expected_cmax * np.exp(-ke * tau)
 
-            if delta_t <= 0:
-                 st.error(f"Time between peak draw ({t_peak_actual}h) and trough ({tau}h) is not positive.")
-                 return
+    # Display results
+    st.markdown(f"**IBW:** {ibw:.2f} kg  \n**Dosing Weight ({weight_used}):** {dosing_weight:.2f} kg  \n**CrCl:** {crcl:.2f} mL/min")
+    
+    # Round the dose to a practical value
+    practical_dose = round(dose / 10) * 10  # Round to nearest 10mg
+    if practical_dose < 100:
+        practical_dose = round(dose / 5) * 5  # For low doses, round to nearest 5mg
+    
+    st.success(f"Recommended Initial Dose: **{practical_dose:.0f} mg** every **{tau:.0f}** hours")
+    st.info(f"Expected Cmax: **{expected_cmax:.2f} mg/L**, Expected Cmin: **{expected_cmin:.2f} mg/L**")
+    
+    # Additional suggestions for loading dose
+    if regimen == "SDD" or (is_hd and expected_cmax < target_cmax * 0.9):
+        loading_dose = target_cmax * vd
+        st.warning(f"Consider loading dose of **{round(loading_dose/10)*10:.0f} mg** to rapidly achieve target peak concentration.")
 
-            try:
-                ke = -math.log(trough / peak) / delta_t
-                if ke <= 0: raise ValueError("Calculated Ke is non-positive.")
-                t_half = 0.693 / ke
+    suggest_adjustment(expected_cmax, target_cmax * 0.9, target_cmax * 1.1, label="Expected Cmax")
+    
+    # For trough target that's a "less than" value
+    if expected_cmin > target_cmin:
+        st.warning(f"⚠️ Expected Cmin ({expected_cmin:.2f} mg/L) is high. Target is <{target_cmin} mg/L. Consider lengthening the interval to a practical regimen ({practical_intervals}).")
+    else:
+        st.success(f"✅ Expected Cmin ({expected_cmin:.2f} mg/L) is below target of {target_cmin} mg/L.")
 
-                # Estimate Cmax at end of infusion (back-extrapolate)
-                time_from_inf_end_to_peak = t_peak_actual - infusion_time
-                if time_from_inf_end_to_peak < 0:
-                     st.warning("Peak drawn during infusion? Calculation assumes peak is post-infusion.")
-                     # Attempt to estimate peak at infusion end based on level during infusion (less accurate)
-                     # This requires more complex model assumptions, simplified here
-                     c_max_est = peak # Use measured peak as approximation if drawn during infusion
+    # Add visualization option
+    if st.checkbox("Show concentration-time curve"):
+        chart = plot_concentration_time_curve(
+            peak=expected_cmax, 
+            trough=expected_cmin,
+            ke=ke,
+            tau=tau
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+    if st.button("🧠 Interpret with LLM"):
+        prompt = (f"Aminoglycoside Initial Dose: Patient: {age} y/o {gender.lower()}, {height} cm, {weight} kg, SCr: {patient_data['serum_cr']} µmol/L. "
+                 f"Drug: {drug}, Regimen: {regimen}, Target Cmax: {target_cmax}, Target Cmin: {target_cmin}, Interval: {tau} hr. "
+                  f"Calculated: Weight {dosing_weight:.2f} kg ({weight_used}), Vd {vd:.2f} L, CrCl {crcl:.2f} mL/min, "
+                  f"Ke {ke:.3f} hr⁻¹, t1/2 {t_half:.2f} hr, Dose {practical_dose:.0f} mg. "
+                  f"Expected Cmax {expected_cmax:.2f} mg/L, Expected Cmin {expected_cmin:.2f} mg/L.")
+        interpret_with_llm(prompt, patient_data)
+
+# ===== MODULE 2: Aminoglycoside Conventional Dosing (C1/C2) =====
+def aminoglycoside_conventional_dosing(patient_data):
+    st.title("📊 Aminoglycoside Adjustment using C1/C2")
+    
+    drug = st.selectbox("Select Drug", ["Gentamicin", "Amikacin"])
+    regimen = st.selectbox("Therapeutic Goal", ["MDD", "SDD", "Synergy", "Hemodialysis", "Neonates"])
+
+    # Set target ranges based on chosen regimen and drug
+    if drug == "Gentamicin":
+        if regimen == "MDD":
+            target_peak = (5, 10)
+            target_trough = (0, 2)
+        elif regimen == "SDD":
+            target_peak = (10, 30)
+            target_trough = (0, 1)
+        elif regimen == "Synergy":
+            target_peak = (3, 5)
+            target_trough = (0, 1)
+        elif regimen == "Hemodialysis":
+            target_peak = (5, 10)  # Display "Not necessary" in UI
+            target_trough = (0, 2)
+        elif regimen == "Neonates":
+            target_peak = (5, 12)
+            target_trough = (0, 1)
+    else:  # Amikacin
+        if regimen == "MDD":
+            target_peak = (20, 30)
+            target_trough = (0, 10)
+        elif regimen == "SDD":
+            target_peak = (60, 60)
+            target_trough = (0, 1)
+        elif regimen == "Synergy":
+            # Show N/A in UI
+            target_peak = (0, 0)
+            target_trough = (0, 0)
+        elif regimen == "Hemodialysis":
+            target_peak = (20, 30)  # Display "Not necessary" in UI
+            target_trough = (0, 10)
+        elif regimen == "Neonates":
+            target_peak = (20, 30)
+            target_trough = (0, 5)
+
+    # Display target ranges with special cases
+    st.markdown("### Target Concentration Ranges:")
+    col1, col2 = st.columns(2)
+    with col1:
+        if regimen == "Synergy" and drug == "Amikacin":
+            st.markdown("**Peak Target:** N/A")
+        elif regimen == "Hemodialysis":
+            st.markdown("**Peak Target:** Not necessary")
+        else:
+            st.markdown(f"**Peak Target:** {target_peak[0]} - {target_peak[1]} mg/L")
+    
+    with col2:
+        if regimen == "Synergy" and drug == "Amikacin":
+            st.markdown("**Trough Target:** N/A")
+        else:
+            if target_trough[1] == 1:
+                st.markdown(f"**Trough Target:** <{target_trough[1]} mg/L")
+            elif target_trough[1] == 2:
+                st.markdown(f"**Trough Target:** <{target_trough[1]} mg/L")
+            elif target_trough[1] == 5:
+                st.markdown(f"**Trough Target:** <{target_trough[1]} mg/L")
+            elif target_trough[1] == 10:
+                st.markdown(f"**Trough Target:** <{target_trough[1]} mg/L")
+            else:
+                st.markdown(f"**Trough Target:** {target_trough[0]} - {target_trough[1]} mg/L")
+    
+    # Add MIC input for SDD regimens with note about peak:MIC ratio
+    if regimen == "SDD":
+        st.markdown("*Note: Target peaks may be individualized based on MIC to achieve peak:MIC ratio of 10:1*")
+        mic = st.number_input("MIC (mg/L)", min_value=0.0, value=1.0, step=0.25)
+        recommended_peak = mic * 10
+        st.info(f"For MIC of {mic} mg/L, recommended peak is ≥{recommended_peak} mg/L")
+    
+    dose = st.number_input("Last Dose (mg)", min_value=0.0)
+    c1 = st.number_input("Pre-dose Level (C1, mg/L)", min_value=0.0, value=1.0)
+    c2 = st.number_input("Post-dose Level (C2, mg/L)", min_value=0.0, value=8.0)
+    tau = st.number_input("Dosing Interval (hr)", value=8.0)
+    t1 = st.number_input("C1 Sample Time After Dose (hr)", value=0.0)
+    t2 = st.number_input("C2 Sample Time After Dose (hr)", value=1.0)
+    t_post = st.number_input("Post-infusion Delay (hr)", value=0.5)
+
+    try:
+        if c1 > 0 and c2 > 0:
+            ke = (math.log(c2) - math.log(c1)) / (tau - (t2 - t1))
+            t_half = 0.693 / ke
+            cmax = c2 * np.exp(ke * t_post)
+            cmin = cmax * np.exp(-ke * tau)
+            vd = dose / (cmax * (1 - np.exp(-ke * tau)))
+            new_dose = cmax * vd * (1 - np.exp(-ke * tau))
+
+            st.markdown(f"**Ke:** {ke:.3f} hr⁻¹  \n**Half-life:** {t_half:.2f} hr  \n**Cmax:** {cmax:.2f} mg/L, **Cmin:** {cmin:.2f} mg/L  \n**Vd:** {vd:.2f} L")
+            st.success(f"Recommended New Dose: **{new_dose:.0f} mg**")
+            
+            # Special handling for regimens with special targets
+            if regimen == "Hemodialysis":
+                if cmin > target_trough[1]:
+                    st.warning(f"⚠️ Trough is high ({cmin:.2f} mg/L). Consider lengthening interval or reducing dose.")
                 else:
-                     c_max_est = peak * math.exp(ke * time_from_inf_end_to_peak)
-
-                # Calculate Vd using Cmax_est (Sawchuk-Zaske method adaptation)
-                factor = 1 - math.exp(-ke * tau)
-                if factor < 1e-9: raise ValueError("Factor for Vd calculation is near zero.")
-                vd = (dose / (ke * infusion_time)) * ( (1 - math.exp(-ke * infusion_time)) / (1 - math.exp(-ke*tau)) ) * (1 - (trough/c_max_est)*math.exp(ke*infusion_time))
-                # Simpler Vd estimation if the above is complex/unstable:
-                # vd = dose / c_max_est # Very rough estimate
-
-                if vd <= 0: raise ValueError("Calculated Vd is non-positive.")
-                cl = ke * vd
-                auc_tau = dose / cl if cl > 0 else 0 # AUC over one interval
-                auc24 = auc_tau * (24 / tau) if tau > 0 else 0
-
-            except (ValueError, OverflowError, ZeroDivisionError) as e:
-                st.error(f"Calculation Error: {e}. Check input values (Peak > Trough > 0, Times).")
-                return
-
-            # Calculate new dose to reach target trough
-            target_trough = (target_cmin[0] + target_cmin[1]) / 2
-            new_dose = 0
-            try:
-                 # Use calculated individual PK parameters
-                 factor = 1 - math.exp(-ke * tau)
-                 if factor > 1e-9:
-                      # Dose = Cpss_target * Vd * factor / exp(-ke*(tau-inf_time)) # Target trough based
-                      # Target AUC based: Dose = TargetAUC24 * Cl * tau / 24
-                      # Let's target trough for this method as per traditional approach
-                       new_dose = target_trough * vd * factor / math.exp(-ke * (tau - infusion_time))
-                 else: new_dose = 0
-            except Exception as e:
-                 st.warning(f"Could not calculate new dose: {e}")
-                 new_dose = 0
-
-            practical_new_dose = round(new_dose / 250) * 250 if new_dose > 0 else 0
-
-            # Display results
-            st.success("Vancomycin Peak-Trough Analysis Complete (Individualized PK)")
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Measured Peak", f"{peak:.1f} mg/L (at {t_peak_actual}h)")
-                st.metric("Measured Trough", f"{trough:.1f} mg/L (at {tau}h)")
-                if trough < target_cmin[0]: st.warning("⚠️ Trough below target")
-                elif trough > target_cmin[1]: st.warning("⚠️ Trough above target")
-                else: st.success("✅ Trough within target")
-            with col2:
-                st.metric("Calc. Ke", f"{ke:.4f} hr⁻¹")
-                st.metric("Calc. t½", f"{t_half:.1f} hr")
-                st.metric("Calc. Vd", f"{vd:.1f} L ({vd/weight:.2f} L/kg)")
-            with col3:
-                st.metric("Calc. Cl", f"{cl:.2f} L/hr")
-                st.metric("Calc. AUC24", f"{auc24:.0f} mg·hr/L")
-                st.metric("Recommended Dose", f"{practical_new_dose:.0f} mg q{tau}h", help="To target trough")
-
-            # Visualization
-            st.subheader("Concentration-Time Curve (Individualized)")
-            chart = plot_concentration_time_curve(
-                f"Vancomycin (Peak-Trough, {'Empirical' if target_cmin[1]<=15 else 'Definitive'})",
-                [], assessment, [], [], "", # Pass empty lists/strings for unused plot args
-                peak=peak, trough=trough, ke=ke, tau=tau, t_peak=t_peak_actual, infusion_time=infusion_time
-            )
-            if chart:
+                    st.success(f"✅ Trough is acceptable ({cmin:.2f} mg/L).")
+                st.info("Note: Peak monitoring is typically not necessary for hemodialysis patients.")
+            elif regimen == "Synergy" and drug == "Amikacin":
+                st.info("Note: Specific targets for Amikacin used in synergy are not established.")
+            else:
+                # Normal suggest_adjustment for other regimens
+                if regimen == "SDD":
+                    # For SDD, compare peak with MIC-based target
+                    if cmax < recommended_peak:
+                        st.warning(f"⚠️ Cmax ({cmax:.2f} mg/L) is below the recommended peak ({recommended_peak} mg/L) for the given MIC.")
+                    else:
+                        st.success(f"✅ Cmax ({cmax:.2f} mg/L) is adequate for the given MIC.")
+                else:
+                    suggest_adjustment(cmax, target_peak[0], target_peak[1], label="Cmax")
+                
+                # Handle trough targets that are "less than" values
+                if target_trough[1] in [1, 2, 5, 10]:
+                    if cmin > target_trough[1]:
+                        st.warning(f"⚠️ Cmin is high ({cmin:.2f} mg/L). Target is <{target_trough[1]} mg/L.")
+                    else:
+                        st.success(f"✅ Cmin is acceptable ({cmin:.2f} mg/L).")
+                else:
+                    suggest_adjustment(cmin, target_trough[0], target_trough[1], label="Cmin")
+            
+            # Add visualization option
+            if st.checkbox("Show concentration-time curve"):
+                chart = plot_concentration_time_curve(
+                    peak=cmax, 
+                    trough=cmin,
+                    ke=ke,
+                    tau=tau
+                )
                 st.altair_chart(chart, use_container_width=True)
 
-            # Interpretation
-            calculation_details = f"""
-            Method: Peak & Trough (Individualized PK)
-            Measured Peak = {peak:.1f} mg/L at {t_peak_actual} hrs
-            Measured Trough = {trough:.1f} mg/L at {tau} hrs
-            Calc. Ke = {ke:.4f} hr⁻¹
-            Calc. t½ = {t_half:.1f} hr
-            Calc. Vd = {vd:.1f} L ({vd/weight:.2f} L/kg)
-            Calc. Cl = {cl:.2f} L/hr
-            Calc. AUC24 = {auc24:.0f} mg·hr/L
-            Target Trough = {target_cmin[0]}-{target_cmin[1]} mg/L
-            Recommended Dose = {practical_new_dose:.0f} mg q{tau}h (to target trough)
-            """
-            prompt = (
-                 f"Vancomycin (Peak and Trough): Measured peak = {peak} mg/L, trough = {trough} mg/L, "
-                 f"Interval = {tau} hr, Ke = {ke:.4f} hr⁻¹, AUC24 = {auc24:.0f} mg·hr/L, "
-                 f"Target trough range = {target_cmin[0]}-{target_cmin[1]} mg/L, "
-                 # Include calculated peak target range if desired
-                 f"Target peak range = {target_peak[0]}-{target_peak[1]} mg/L, Recommended base dose = {practical_new_dose:.0f} mg."
-            )
-            interpret_with_llm(prompt, patient_data, calculation_details)
+            if st.button("🧠 Interpret with LLM"):
+                prompt = (f"Aminoglycoside TDM result: Drug: {drug}, Regimen: {regimen}, Dose: {dose} mg, "
+                          f"C1: {c1} mg/L, C2: {c2} mg/L, Interval: {tau} hr. "
+                          f"Ke: {ke:.3f}, t1/2: {t_half:.2f}, Vd: {vd:.2f}, Cmax: {cmax:.2f}, Cmin: {cmin:.2f}. "
+                          f"Suggested new dose: {new_dose:.0f} mg.")
+                if regimen == "SDD":
+                    prompt += f" MIC: {mic} mg/L, Target peak:MIC ratio: 10:1"
+                interpret_with_llm(prompt, patient_data)
+        else:
+            st.error("❌ C1 and C2 must be greater than 0 to perform calculations.")
+    except Exception as e:
+        st.error(f"Calculation error: {e}")
 
-
-def vancomycin_auc_guided(patient_data):
-    """Vancomycin AUC-guided monitoring method using two levels"""
-    st.markdown("---")
-    st.write("##### AUC-Guided Monitoring (Two Levels)")
-    st.info("Preferred approach using two post-dose levels for accurate AUC calculation.")
-
-    target_auc_strategy = st.radio(
-        "Target AUC24 Range",
-        ["400-600 mg·hr/L (Standard)", "500-700 mg·hr/L (Serious/CNS)"],
-        key="vanco_auc_target", help="Select target based on infection type/severity (per 2020 guidelines)"
+# ===== MODULE 3: Vancomycin AUC-based Dosing =====
+def vancomycin_auc_dosing(patient_data):
+    st.title("🧪 Vancomycin AUC-Based Dosing")
+    
+    # Unpack patient data for easier access
+    weight = patient_data['weight']
+    crcl = patient_data['crcl']
+    gender = patient_data['gender']
+    age = patient_data['age']
+    
+    method = st.radio("Select Method", ["Trough only", "Peak and Trough"], horizontal=True)
+    
+    # Global trough target selection (shown regardless of method)
+    target_trough_strategy = st.selectbox(
+        "Select Target Strategy", 
+        ["Empirical (10-15 mg/L)", "Definitive (15-20 mg/L)"]
     )
-    target_auc = (400, 600) if "Standard" in target_auc_strategy else (500, 700)
+    
+    # Set targets based on selected strategy
+    if "Empirical" in target_trough_strategy:
+        target_cmin = (10, 15)
+        target_peak = (20, 30) # Empirical peak targets
+    else:
+        target_cmin = (15, 20)
+        target_peak = (30, 40) # Definitive peak targets
+    
+    st.markdown(f"**Target Trough Range:** {target_cmin[0]} - {target_cmin[1]} mg/L")
+    
+    # Only show peak targets for Peak and Trough method
+    if method == "Peak and Trough":
+        st.markdown(f"**Target Peak Range:** {target_peak[0]} - {target_peak[1]} mg/L")
+    
+    # Already have weight from sidebar
+    
+    st.info(f"Practical dosing intervals include: {practical_intervals}.")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        dose = st.number_input("Current Dose (mg)", min_value=250, max_value=5000, value=1000, step=250, key="vanco_auc_dose")
-        interval = st.number_input("Dosing Interval (hours)", min_value=6, max_value=72, value=12, step=4, key="vanco_auc_interval")
-        first_level = st.number_input("First Concentration (mg/L)", min_value=0.1, max_value=100.0, value=25.0, step=0.1, key="vanco_auc_level1") # Min > 0
-        first_time = st.number_input("Time After START of Infusion for First Sample (hours)", min_value=0.6, max_value=12.0, value=2.0, step=0.5, key="vanco_auc_time1", help="Typically 1-2 hours post-infusion")
-    with col2:
-        infusion_time = st.number_input("Infusion Duration (hours)", min_value=0.5, max_value=4.0, value=1.0, step=0.5, key="vanco_auc_infusion")
-        second_level = st.number_input("Second Concentration (mg/L)", min_value=0.1, max_value=100.0, value=15.0, step=0.1, key="vanco_auc_level2") # Min > 0
-        second_time = st.number_input("Time After START of Infusion for Second Sample (hours)", min_value=first_time + 1.0, max_value=24.0, value=6.0, step=0.5, key="vanco_auc_time2", help="Typically 4-8 hours after first sample")
-
-    if st.button("Calculate Vancomycin AUC Dosing", key="vanco_auc_calc"):
-        with st.spinner("Performing AUC calculations..."):
-            weight = patient_data.get('weight', 0)
-            if weight <= 0:
-                st.error("Valid Weight is required for Vd/kg calculation.")
-                return
-            if first_level <= 0 or second_level <= 0 or first_level <= second_level:
-                 st.error("Invalid levels: First level must be > Second level and both > 0.")
-                 return
-            if second_time <= first_time:
-                 st.error("Time for second sample must be after the first sample.")
-                 return
-
-            # Calculate individualized PK from two levels
-            delta_time = second_time - first_time
-            if delta_time <= 0:
-                 st.error("Time difference between samples must be positive.")
-                 return
-
-            try:
-                ke = -math.log(second_level / first_level) / delta_time
-                if ke <= 0: raise ValueError("Calculated Ke is non-positive.")
-                t_half = 0.693 / ke
-
-                # Estimate Cmax at end of infusion (back-extrapolate from first level)
-                time_from_inf_end_to_first = first_time - infusion_time
-                if time_from_inf_end_to_first < 0:
-                     st.warning("First level drawn during infusion? Calculation assumes post-infusion levels.")
-                     # Use first level as rough Cmax_est if drawn during infusion
-                     c_max_est = first_level
-                else:
-                     c_max_est = first_level * math.exp(ke * time_from_inf_end_to_first)
-
-
-                # Estimate Cmin (trough) at end of interval (extrapolate from second level)
-                time_from_second_to_trough = interval - second_time
-                if time_from_second_to_trough < 0:
-                     st.warning("Second level drawn after end of interval? Check timing.")
-                     # Use second level as rough trough if drawn late
-                     trough_est = second_level
-                else:
-                     trough_est = second_level * math.exp(-ke * time_from_second_to_trough)
-
-
-                # Calculate Vd using Bayesian approach (preferred) or algebraic method
-                # Algebraic method (less precise than Bayesian software):
-                # Vd = (Dose / infusion_time) * (1 - math.exp(-ke * infusion_time)) / (ke * (Cmax_est - Trough_est * math.exp(-ke * (interval - infusion_time)))) # Complex formula
-                # Simplified Vd based on Cmax_est:
-                vd = dose / c_max_est # Very rough estimate, use with caution
-                if vd <= 0: raise ValueError("Estimated Vd is non-positive.")
-
-                cl = ke * vd
-                auc_tau = dose / cl if cl > 0 else 0 # AUC over one interval
-                auc24 = auc_tau * (24 / interval) if interval > 0 else 0
-
-            except (ValueError, OverflowError, ZeroDivisionError) as e:
-                st.error(f"Calculation Error: {e}. Check input values and timings.")
-                return
-
-            # Calculate new dose to reach target AUC24
-            target_auc24_mid = (target_auc[0] + target_auc[1]) / 2
-            new_dose = 0
-            if cl > 0 and interval > 0:
-                 new_dose = (target_auc24_mid * cl * interval) / 24
+    if method == "Trough only":
+        current_dose = st.number_input("Current Total Daily Dose (mg)", value=2000)
+        # Use CrCl from sidebar calculations
+        tau = st.number_input("Dosing Interval (hr)", value=12.0)
+        
+        # Add measured trough input field
+        measured_trough = st.number_input("Measured Trough Level (mg/L)", min_value=0.0, value=0.0)
+        has_measured_trough = measured_trough > 0
+        
+        ke = 0.0044 + 0.00083 * crcl
+        vd = 0.7 * weight
+        cl = ke * vd
+        
+        # If we have a measured trough, use it for calculations
+        if has_measured_trough:
+            # Using formula from the image: Cmax = Cmin + Dose(mg)/V(L)
+            estimated_dose_per_interval = current_dose/(24/tau)
+            estimated_peak = measured_trough + estimated_dose_per_interval / vd
+            estimated_trough = measured_trough
+            
+            # Calculate Ke from measured trough if possible (formula b in "Only trough level available")
+            # This is more accurate than the population estimate
+            # ln(Cmax-ln(Cmin))/T
+            ke_measured = math.log(estimated_peak / measured_trough) / tau
+            if 0.001 < ke_measured < 0.3:  # Sanity check on calculated Ke
+                ke = ke_measured
+                st.info(f"Using Ke calculated from measured trough: {ke:.4f} hr⁻¹")
+        else:
+            # Use population estimates if no measured trough
+            estimated_peak = current_dose / (vd * (1 - np.exp(-ke * tau)))
+            estimated_trough = estimated_peak * np.exp(-ke * tau)
+            st.info("Using population parameters (no measured trough provided)")
+            
+        # Calculate AUC24 using linear trapezoidal method from the image
+        # AUC(inf) = t' × (Cmin+Cmax)/2
+        # AUC(elim) = (Cmax-Cmin)/Ke  
+        # AUC24 = (AUCinf + AUCelim) × (24/T)
+        
+        infusion_time = 1  # Assuming standard 1-hour infusion
+        
+        # AUC during infusion phase using trapezoidal method
+        auc_inf = infusion_time * (0 + estimated_peak) / 2
+        
+        # AUC during elimination phase
+        auc_elim = (estimated_peak - estimated_trough) / ke
+        
+        # Total AUC for one interval
+        auc_tau = auc_inf + auc_elim
+        
+        # Scale to 24 hours
+        auc24 = auc_tau * (24 / tau)
+        
+        st.info(f"AUC24: {auc24:.1f} mg·hr/L")
+        
+        if has_measured_trough:
+            st.markdown(f"Measured Trough: **{measured_trough:.1f} mg/L**")
+        else:
+            st.markdown(f"Estimated Trough: **{estimated_trough:.1f} mg/L**")
+        
+        # Enhanced suggest_adjustment with practical dosing recommendations
+        trough_to_check = measured_trough if has_measured_trough else estimated_trough
+        
+        if trough_to_check < target_cmin[0]:
+            practical_options = []
+            # Try shorter intervals
+            for interval in [6, 8, 12]:
+                if interval < tau:
+                    adj_dose = (current_dose / tau) * interval
+                    new_peak = adj_dose / (vd * (1 - np.exp(-ke * interval)))
+                    new_trough = new_peak * np.exp(-ke * interval)
+                    if target_cmin[0] <= new_trough <= target_cmin[1]:
+                        practical_options.append(f"🔷 {adj_dose:.0f}mg q{interval}h")
+            # Try increased dose at same interval
+            adj_dose = current_dose * (target_cmin[0] / trough_to_check) * 1.1  # 10% buffer
+            new_peak = adj_dose / (vd * (1 - np.exp(-ke * tau)))
+            new_trough = new_peak * np.exp(-ke * tau)
+            if target_cmin[0] <= new_trough <= target_cmin[1]:
+                practical_options.append(f"🔷 {adj_dose:.0f}mg q{tau}h")
+                
+            if practical_options:
+                st.warning(f"⚠️ Trough is low ({trough_to_check:.1f} mg/L). Consider these practical options:")
+                for option in practical_options:
+                    st.markdown(option)
             else:
-                 st.warning("Cannot calculate new dose due to invalid PK parameters.")
-
-            practical_new_dose = round(new_dose / 250) * 250 if new_dose > 0 else 0
-
-            # Display results
-            st.success("Vancomycin AUC Analysis Complete (Individualized PK)")
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("First Level", f"{first_level:.1f} mg/L at {first_time}h")
-                st.metric("Second Level", f"{second_level:.1f} mg/L at {second_time}h")
-                st.metric("Calculated AUC24", f"{auc24:.0f} mg·hr/L")
-                if auc24 < target_auc[0]: st.warning("⚠️ AUC below target")
-                elif auc24 > target_auc[1]: st.warning("⚠️ AUC above target")
-                else: st.success("✅ AUC within target")
-            with col2:
-                st.metric("Calc. Ke", f"{ke:.4f} hr⁻¹")
-                st.metric("Calc. t½", f"{t_half:.1f} hr")
-                st.metric("Est. Trough", f"{trough_est:.1f} mg/L")
-            with col3:
-                st.metric("Est. Vd", f"{vd:.1f} L ({vd/weight:.2f} L/kg)", help="Approximate Vd")
-                st.metric("Calc. Cl", f"{cl:.2f} L/hr")
-                st.metric("Recommended Dose", f"{practical_new_dose:.0f} mg q{interval}h", help="To target AUC")
-
-            # Visualization - Use estimated peak/trough for plotting
-            st.subheader("Concentration-Time Curve (Individualized)")
+                st.warning(f"⚠️ Trough is low ({trough_to_check:.1f} mg/L). Consider increasing dose or shortening interval.")
+                
+        elif trough_to_check > target_cmin[1]:
+            practical_options = []
+            # Try longer intervals
+            for interval in [8, 12, 24]:
+                if interval > tau:
+                    adj_dose = (current_dose / tau) * interval
+                    new_peak = adj_dose / (vd * (1 - np.exp(-ke * interval)))
+                    new_trough = new_peak * np.exp(-ke * interval)
+                    if target_cmin[0] <= new_trough <= target_cmin[1]:
+                        practical_options.append(f"🔷 {adj_dose:.0f}mg q{interval}h")
+            # Try decreased dose at same interval
+            adj_dose = current_dose * (target_cmin[1] / trough_to_check) * 0.9  # 10% buffer
+            new_peak = adj_dose / (vd * (1 - np.exp(-ke * tau)))
+            new_trough = new_peak * np.exp(-ke * tau)
+            if target_cmin[0] <= new_trough <= target_cmin[1]:
+                practical_options.append(f"🔷 {adj_dose:.0f}mg q{tau}h")
+                
+            if practical_options:
+                st.warning(f"⚠️ Trough is high ({trough_to_check:.1f} mg/L). Consider these practical options:")
+                for option in practical_options:
+                    st.markdown(option)
+            else:
+                st.warning(f"⚠️ Trough is high ({trough_to_check:.1f} mg/L). Consider decreasing dose or lengthening interval.")
+        else:
+            st.success(f"✅ Trough is within target range ({trough_to_check:.1f} mg/L).")
+        
+        # Add AUC check as well
+        if 400 <= auc24 <= 600:
+            st.success(f"✅ AUC24 is within target range (400-600 mg·hr/L)")
+        elif auc24 < 400:
+            st.warning(f"⚠️ AUC24 is low ({auc24:.1f} mg·hr/L). Consider increasing dose.")
+        else:
+            st.warning(f"⚠️ AUC24 is high ({auc24:.1f} mg·hr/L). Consider decreasing dose.")
+            
+        # Calculate new TDD based on the formula in the image
+        if has_measured_trough:
+            desired_auc = 500  # Target middle of the range 400-600
+            new_tdd = current_dose * (desired_auc / auc24)
+            st.success(f"Recommended new TDD based on measured trough: **{new_tdd:.0f} mg/day**")
+        
+        # Add visualization option
+        if st.checkbox("Show concentration-time curve"):
             chart = plot_concentration_time_curve(
-                f"Vancomycin (AUC-Guided, Target {target_auc[0]}-{target_auc[1]})",
-                [], assessment, [], [], "", # Pass empty lists/strings for unused plot args
-                peak=c_max_est, trough=trough_est, ke=ke, tau=interval, t_peak=infusion_time, infusion_time=infusion_time
+                peak=estimated_peak, 
+                trough=trough_to_check,
+                ke=ke,
+                tau=tau
             )
-            if chart:
-                 # Add measured points to the plot
-                 points = alt.Chart(pd.DataFrame({
-                     'Time (hr)': [first_time, second_time],
-                     'Concentration (mg/L)': [first_level, second_level],
-                     'Label': ['Level 1', 'Level 2']
-                 })).mark_point(size=100, filled=True, color='red').encode(
-                     x='Time (hr)',
-                     y='Concentration (mg/L)',
-                     tooltip=['Label', 'Time (hr)', 'Concentration (mg/L)']
-                 )
-                 st.altair_chart(chart + points, use_container_width=True)
+            st.altair_chart(chart, use_container_width=True)
+            
+        if st.button("🧠 Interpret with LLM"):
+            trough_info = f"Measured trough = {measured_trough} mg/L" if has_measured_trough else f"Estimated trough = {estimated_trough:.1f} mg/L"
+            prompt = (
+                f"Vancomycin (Trough only): Current dose = {current_dose} mg/day, CrCl = {crcl:.1f} mL/min, "
+                f"Weight = {weight} kg, Dosing interval = {tau} hr, Ke = {ke:.4f} hr⁻¹, Vd = {vd:.2f} L, "
+                f"AUC24 = {auc24:.1f} mg·hr/L, {trough_info}, "
+                f"Target trough range = {target_cmin[0]}-{target_cmin[1]} mg/L."
+            )
+            interpret_with_llm(prompt, patient_data)
+    
+    else:  # Peak and Trough method
+        peak = st.number_input("Measured Peak (mg/L)", min_value=0.0)
+        trough = st.number_input("Measured Trough (mg/L)", min_value=0.0)
+        current_dose = st.number_input("Current Dose (mg)", min_value=0.0, value=1000.0)
+        tau = st.number_input("Dosing Interval (hr)", value=12.0)
+        t_peak = st.number_input("Time of Peak Sample (hr)", value=1.0)
+        t_trough = st.number_input("Time of Trough Sample (hr)", value=tau)
+        
+        try:
+            ke = (math.log(peak) - math.log(trough)) / (t_trough - t_peak)
+            t_half = 0.693 / ke
+            
+            # Calculate AUC using the linear-log trapezoidal method as per reference:
+            # AUC(inf) = t' × (Cmin+Cmax)/2
+            # AUC(elim) = (Cmax-Cmin)/Ke
+            # AUC24 = (AUCinf + AUCelim) × (24/T)
+            
+            t_prime = t_trough - t_peak  # Time between samples
+            
+            # Infusion phase (trapezoidal)
+            auc_inf = t_prime * (trough + peak) / 2
+            
+            # Elimination phase
+            auc_elim = (peak - trough) / ke
+            
+            # Total AUC for one dosing interval
+            auc_tau = auc_inf + auc_elim
+            
+            # Scale to 24 hours
+            auc24 = auc_tau * (24 / tau)
+            
+            st.info(f"Ke: {ke:.4f} hr⁻¹ | t½: {t_half:.2f} hr")
+            st.success(f"AUC24: {auc24:.1f} mg·hr/L")
+            
+            # Enhanced suggestions for trough
+            if trough < target_cmin[0]:
+                practical_options = []
+                # Try shorter intervals
+                for interval in [6, 8, 12]:
+                    if interval < tau:
+                        adj_dose = current_dose * (target_cmin[0] / trough) * (1 - np.exp(-ke * interval)) / (1 - np.exp(-ke * tau))
+                        new_trough = adj_dose * np.exp(-ke * interval) / (1 - np.exp(-ke * interval))
+                        if target_cmin[0] <= new_trough <= target_cmin[1]:
+                            practical_options.append(f"🔷 {adj_dose:.0f}mg q{interval}h")
+                # Try increased dose at same interval
+                adj_dose = current_dose * (target_cmin[0] / trough) * 1.1  # 10% buffer
+                if practical_options:
+                    st.warning(f"⚠️ Trough is low ({trough:.1f} mg/L). Consider these practical options:")
+                    for option in practical_options:
+                        st.markdown(option)
+                else:
+                    st.warning(f"⚠️ Trough is low ({trough:.1f} mg/L). Consider increasing dose to {adj_dose:.0f}mg or shortening interval.")
+            elif trough > target_cmin[1]:
+                practical_options = []
+                # Try longer intervals
+                for interval in [8, 12, 24]:
+                    if interval > tau:
+                        adj_dose = current_dose * (target_cmin[1] / trough) * (1 - np.exp(-ke * interval)) / (1 - np.exp(-ke * tau))
+                        new_trough = adj_dose * np.exp(-ke * interval) / (1 - np.exp(-ke * interval))
+                        if target_cmin[0] <= new_trough <= target_cmin[1]:
+                            practical_options.append(f"🔷 {adj_dose:.0f}mg q{interval}h")
+                # Try decreased dose at same interval
+                adj_dose = current_dose * (target_cmin[1] / trough) * 0.9  # 10% buffer
+                if practical_options:
+                    st.warning(f"⚠️ Trough is high ({trough:.1f} mg/L). Consider these practical options:")
+                    for option in practical_options:
+                        st.markdown(option)
+                else:
+                    st.warning(f"⚠️ Trough is high ({trough:.1f} mg/L). Consider decreasing dose to {adj_dose:.0f}mg or lengthening interval.")
+            else:
+                st.success(f"✅ Trough is within target range ({trough:.1f} mg/L).")
+            
+            # Enhanced suggestions for peak
+            if peak < target_peak[0]:
+                st.warning(f"⚠️ Peak is low ({peak:.1f} mg/L). Target: {target_peak[0]}-{target_peak[1]} mg/L")
+            elif peak > target_peak[1]:
+                st.warning(f"⚠️ Peak is high ({peak:.1f} mg/L). Target: {target_peak[0]}-{target_peak[1]} mg/L")
+            else:
+                st.success(f"✅ Peak is within target range ({peak:.1f} mg/L).")
+            
+            # AUC check
+            if 400 <= auc24 <= 600:
+                st.success(f"✅ AUC24 is within target range (400-600 mg·hr/L)")
+            elif auc24 < 400:
+                st.warning(f"⚠️ AUC24 is low ({auc24:.1f} mg·hr/L). Consider increasing dose.")
+            else:
+                st.warning(f"⚠️ AUC24 is high ({auc24:.1f} mg·hr/L). Consider decreasing dose.")
+            
+            vd = current_dose / (peak * (1 - np.exp(-ke * tau)))
+            st.info(f"Estimated Vd: {vd:.2f} L")
+            
+            # Calculate new dose based on target ranges
+            target_min_trough = target_cmin[0]
+            new_dose = target_min_trough * vd * (1 - np.exp(-ke * tau)) / np.exp(-ke * tau)
+            
+            st.success(f"Recommended Base Dose: **{new_dose:.0f} mg**")
+            
+            # Provide practical dosing options
+            practical_doses = []
+            for interval in [6, 8, 12, 24]:
+                adj_dose = target_min_trough * vd * (1 - np.exp(-ke * interval)) / np.exp(-ke * interval)
+                practical_doses.append((interval, adj_dose))
+            
+            st.subheader("Practical Dosing Options:")
+            for interval, dose in practical_doses:
+                expected_trough = dose * np.exp(-ke * interval) / (1 - np.exp(-ke * interval))
+                expected_auc = ((dose - expected_trough) / ke + expected_trough * interval) * (24 / interval)
+                if target_cmin[0] <= expected_trough <= target_cmin[1] and 400 <= expected_auc <= 600:
+                    st.success(f"✅ {dose:.0f}mg q{interval}h (Est. trough: {expected_trough:.1f}, AUC: {expected_auc:.1f})")
+                else:
+                    st.info(f"🔹 {dose:.0f}mg q{interval}h (Est. trough: {expected_trough:.1f}, AUC: {expected_auc:.1f})")
+            
+            # Add visualization option
+            if st.checkbox("Show concentration-time curve"):
+                chart = plot_concentration_time_curve(
+                    peak=peak, 
+                    trough=trough,
+                    ke=ke,
+                    tau=tau
+                )
+                st.altair_chart(chart, use_container_width=True)
+            
+            if st.button("🧠 Interpret with LLM"):
+                prompt = (
+                    f"Vancomycin (Peak and Trough): Measured peak = {peak} mg/L, trough = {trough} mg/L, "
+                    f"Interval = {tau} hr, Ke = {ke:.4f} hr⁻¹, AUC24 = {auc24:.1f} mg·hr/L, "
+                    f"Target trough range = {target_cmin[0]}-{target_cmin[1]} mg/L, "
+                    f"Target peak range = {target_peak[0]}-{target_peak[1]} mg/L, Recommended base dose = {new_dose:.0f} mg."
+                )
+                interpret_with_llm(prompt, patient_data)
+        except Exception as e:
+            st.error(f"Calculation error: {e}")
 
+# ===== MAIN APPLICATION CODE =====
+def main():
+    # Set up sidebar and get patient data
+    patient_data = setup_sidebar_and_navigation()
+    
+    # Route to appropriate module based on selected page
+    if patient_data['page'] == "Aminoglycoside: Initial Dose":
+        aminoglycoside_initial_dose(patient_data)
+    elif patient_data['page'] == "Aminoglycoside: Conventional Dosing (C1/C2)":
+        aminoglycoside_conventional_dosing(patient_data)
+    elif patient_data['page'] == "Vancomycin AUC-based Dosing":
+        vancomycin_auc_dosing(patient_data)
+    else:
+        st.error(f"Unknown page: {patient_data['page']}")
 
-            # Interpretation
-            calculation_details = f"""
-            Method: AUC-Guided (Two Levels, Individualized PK)
-            Level 1 = {first_level:.1f} mg/L at {first_time} hrs
-            Level 2 = {second_level:.1f} mg/L at {second_time} hrs
-            Calc. Ke = {ke:.4f} hr⁻¹
-            Calc. t½ = {t_half:.
+# Run the application
+if __name__ == "__main__":
+    main()
